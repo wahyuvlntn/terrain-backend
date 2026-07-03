@@ -1,0 +1,25 @@
+package api
+
+func (s *Server) registerAll() {
+	s.registerUser()
+	s.registerFilter()
+	s.registerLocation()
+	s.registerAsset()
+	s.registerAlarm()
+	s.registerMaintenanceOrder()
+	s.registerWorkReport()
+	s.registerPerformance()
+	s.registerInstruction()
+	s.registerPersonnel()
+	s.registerEarlyWarning()
+	s.registerGateway()
+	s.registerEquipment()
+	s.registerLicense()
+	s.registerModel()
+	s.registerMapping()
+	s.registerMaster()
+	s.registerNotification()
+	s.registerTheme()
+	s.registerDigitalTwin()
+	s.registerDigitalTwinControl()
+}
