@@ -1,0 +1,99 @@
+# Complete stack: PostgreSQL, MinIO and the AFDD backend.
+# The web UI (frontend repository, Dockerfile.nlam + nginx.conf) proxies /api
+# and /public to the backend on port 4500.
+#
+#   docker compose up -d --build
+#   docker compose logs backend   # shows the generated superuser password on first start
+#
+# Demo plant (seeded data + live MQTT simulator):
+#
+#   docker compose --profile demo up -d --build
+#   docker compose logs -f simulator
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: afdd
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-afdd}
+      POSTGRES_DB: afdd
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U afdd -d afdd"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: pgsty/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-afddminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-afddminio-secret}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9001:9001" # MinIO console (optional)
+
+  backend:
+    build: .
+    image: afdd-backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://afdd:${POSTGRES_PASSWORD:-afdd}@postgres:5432/afdd?sslmode=disable
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-afddminio}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-afddminio-secret}
+      MINIO_BUCKET: afdd
+      BOOTSTRAP_USERNAME: ${BOOTSTRAP_USERNAME:-superuser}
+      BOOTSTRAP_PASSWORD: ${BOOTSTRAP_PASSWORD:-}
+      LICENSE_PUBLIC_KEY: ${LICENSE_PUBLIC_KEY:-}
+      DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-Asia/Singapore}
+      # Put certificate files in ./certs and set e.g.
+      # TLS_CERT_FILE=/certs/localhost.pem and TLS_KEY_FILE=/certs/localhost-key.pem in .env
+      # (otherwise a self-signed certificate is generated).
+      TLS_CERT_FILE: ${TLS_CERT_FILE:-}
+      TLS_KEY_FILE: ${TLS_KEY_FILE:-}
+    volumes:
+      - backenddata:/data
+      - ./certs:/certs:ro
+    ports:
+      - "4500:4500" # HTTPS API
+      - "1883:1883" # MQTT (devices)
+      - "8883:8883" # MQTT over TLS (devices)
+      - "9002:9002" # MQTT over secure WebSocket (web UI notifications)
+
+  # Demo: seeds a semiconductor fab utility plant (once) and streams live
+  # telemetry with faults, trips and a simulated maintenance team.
+  simulator:
+    build: .
+    profiles: ["demo"]
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    entrypoint: ["afdd-sim"]
+    command: ["start"]
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgres://afdd:${POSTGRES_PASSWORD:-afdd}@postgres:5432/afdd?sslmode=disable
+      API_URL: https://backend:4500
+      MQTT_URL: tcp://backend:1883
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-Demo@2026}
+      HISTORY_DAYS: ${DEMO_HISTORY_DAYS:-60}
+      SIM_WORKFORCE: ${SIM_WORKFORCE:-true}
+      DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-Asia/Singapore}
+
+volumes:
+  pgdata:
+  miniodata:
+  backenddata:
