@@ -1,0 +1,22 @@
+# AFDD AI services (ai-agent, ai-mcp, ai-analytics). Python 3.12 (image) / 3.13 (host tests).
+google-adk[db,mcp]==2.11.0
+google-genai>=2.19,<3
+mcp>=2.3,<3
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+httpx>=0.28,<1
+pydantic>=2.12,<3
+psycopg[binary,pool]==3.3.6
+asyncpg==0.32.0
+sqlalchemy[asyncio]==2.1.4
+pgvector==0.5.1
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+lightgbm==4.7.0
+optuna==5.0.0
+pypdf==6.20.0
+fpdf2==2.8.9
+minio==7.2.20
+pytest>=8
+pytest-asyncio>=0.24
