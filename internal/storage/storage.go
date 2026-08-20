@@ -236,6 +236,64 @@ func (s *Store) Exists(ctx context.Context, key string) bool {
 	return err == nil
 }
 
+// ErrNotFound is returned by Open for a missing object.
+var ErrNotFound = errors.New("object not found")
+
+// Bucket returns the name of the store's bucket.
+func (s *Store) Bucket() string { return s.bucket }
+
+// Put stores r under an explicit object key (e.g. rag/2026/<uuid>.pdf in the
+// private documents bucket). The key must be a clean relative path. URL is
+// left empty: only the public store is served under /public/.
+func (s *Store) Put(ctx context.Context, key, contentType string, r io.Reader, size int64) (*Saved, error) {
+	clean := strings.Trim(path.Clean("/"+strings.ReplaceAll(key, `\`, "/")), "/")
+	if clean == "" || clean == "." || clean != key {
+		return nil, fmt.Errorf("invalid object key %q", key)
+	}
+	if size <= 0 {
+		size = -1
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if _, err := s.client.PutObject(ctx, s.bucket, key, r, size, minio.PutObjectOptions{ContentType: contentType}); err != nil {
+		return nil, fmt.Errorf("upload object: %w", err)
+	}
+	if size < 0 {
+		if st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{}); err == nil {
+			size = st.Size
+		}
+	}
+	return &Saved{Key: key, Name: path.Base(key), ContentType: contentType, Size: size}, nil
+}
+
+// Object is an opened stored object: a seekable reader (for range requests)
+// with its metadata. Close it after use.
+type Object struct {
+	io.ReadSeekCloser
+	Size        int64
+	ContentType string
+	ModTime     time.Time
+	ETag        string
+}
+
+// Open opens an object for streaming; ErrNotFound when it does not exist.
+func (s *Store) Open(ctx context.Context, key string) (*Object, error) {
+	st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		var resp minio.ErrorResponse
+		if errors.As(err, &resp) && (resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("stat object: %w", err)
+	}
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get object: %w", err)
+	}
+	return &Object{ReadSeekCloser: obj, Size: st.Size, ContentType: st.ContentType, ModTime: st.LastModified, ETag: st.ETag}, nil
+}
+
 // Read returns the full content of an object.
 func (s *Store) Read(ctx context.Context, key string) ([]byte, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
