@@ -4,6 +4,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -41,6 +42,17 @@ type Config struct {
 	MinioBucket    string
 	MinioUseSSL    bool
 	MinioRegion    string
+	// Private bucket of the AI document library (RAG PDFs). Never served
+	// under /public, so it must differ from MinioBucket.
+	DocsBucket string
+
+	// Agentic AI services (docs/agentic/DESIGN.md)
+	AgentURL    string // ai-agent base URL proxied under /api/agent/ (empty = assistant disabled)
+	AgentSecret string // shared secret sent to the AI services as X-Agent-Secret
+	// Login passwords of the database roles afdd_ai / afdd_ai_ro, set at
+	// start-up when not empty (the roles are NOLOGIN until then).
+	AIDBPassword   string
+	AIDBROPassword string
 
 	// Embedded MQTT broker
 	MQTTEnabled        bool
@@ -101,6 +113,12 @@ func Load() (*Config, error) {
 		MinioBucket:    env("MINIO_BUCKET", "afdd"),
 		MinioUseSSL:    envBool("MINIO_USE_SSL", false),
 		MinioRegion:    env("MINIO_REGION", ""),
+		DocsBucket:     env("MINIO_DOCS_BUCKET", "afdd-docs"),
+
+		AgentURL:       strings.TrimRight(env("AGENT_URL", "http://ai-agent:8000"), "/"),
+		AgentSecret:    env("AGENT_SHARED_SECRET", ""),
+		AIDBPassword:   env("AI_DB_PASSWORD", ""),
+		AIDBROPassword: env("AI_DB_RO_PASSWORD", ""),
 
 		MQTTEnabled:        envBool("MQTT_ENABLED", true),
 		MQTTTCPAddr:        env("MQTT_TCP_ADDR", ":1883"),
@@ -143,6 +161,17 @@ func Load() (*Config, error) {
 	}
 	if c.BuildingLevel < 0 {
 		c.BuildingLevel = 0
+	}
+	if c.DocsBucket == "" {
+		c.DocsBucket = "afdd-docs"
+	}
+	if c.DocsBucket == c.MinioBucket {
+		return nil, fmt.Errorf("MINIO_DOCS_BUCKET must differ from MINIO_BUCKET (%q is served publicly under /public)", c.MinioBucket)
+	}
+	if c.AgentURL != "" {
+		if u, err := url.Parse(c.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("AGENT_URL must be an absolute http(s) URL, got %q", c.AgentURL)
+		}
 	}
 	return c, nil
 }
