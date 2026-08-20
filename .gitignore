@@ -13,3 +13,9 @@
 
 # local certificates
 /certs/
+
+# python (agentic AI services)
+agentic/.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/

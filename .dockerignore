@@ -1,0 +1,32 @@
+# Build context of the Go image (Dockerfile: ./cmd/server and ./cmd/simulator).
+# Keep secrets, VCS data and everything the Go build does not need out of it, so
+# it stays small and unrelated edits do not invalidate the COPY . . layer.
+
+# VCS and secrets
+.git
+.gitignore
+.env
+.env.*
+certs
+
+# Python AI services (own image and context: ./agentic)
+agentic
+**/__pycache__
+**/*.pyc
+.pytest_cache
+
+# Not needed by the Go build: docs, integration tests (test/integration is a
+# test-only package, never imported by cmd/*), the postgres image context and
+# the compose file
+docs
+test
+docker
+docker-compose.yml
+
+# Local runtime data, build output, editors
+data
+.devrun
+bin
+*.exe
+.idea
+.vscode
