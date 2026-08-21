@@ -1,12 +1,13 @@
 // Package scheduler runs the periodic background jobs: email digests,
 // maintenance schedule extension and reminders, KPI refresh, running hour
-// monitoring, license expiry notifications, session cleanup and data
-// retention. Every job takes a PostgreSQL advisory lock so that several
-// backend instances never run the same job concurrently.
+// monitoring, license expiry notifications, session cleanup, partition
+// maintenance and data retention. Every job takes a PostgreSQL advisory lock
+// so that several backend instances never run the same job concurrently.
 package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -59,9 +60,63 @@ func New(d Deps) *Scheduler {
 		{Name: "license-expiry", Interval: time.Hour, Delay: time.Minute, Run: s.checkLicenses},
 		{Name: "session-cleanup", Interval: time.Hour, Delay: 2 * time.Minute, Run: d.CleanSessions},
 		{Name: "kpi-refresh", Interval: 15 * time.Minute, Delay: 90 * time.Second, Run: d.RefreshKPIs},
+		// Also run once at start-up (MaintainPartitions) before the engine logs
+		// values; the first scheduled run retries soon in case that one failed.
+		{Name: PartitionMaintenanceJob, Interval: 24 * time.Hour, Delay: 10 * time.Minute, Run: s.MaintainPartitions},
 		{Name: "retention", Interval: 24 * time.Hour, Delay: 5 * time.Minute, Run: s.retention},
 	}
 	return s
+}
+
+// PartitionMaintenanceJob is the name of the job that creates the monthly
+// partitions of ts.parameter_values.
+const PartitionMaintenanceJob = "partition-maintenance"
+
+const (
+	// partitionMonthsAhead is how many months after the current one get their
+	// ts.parameter_values partition in advance.
+	partitionMonthsAhead = 3
+	// maxPartitionMonthsBack caps how far back empty partitions are created
+	// for a long retention period (730 days, the default, fits). Older data
+	// can still be written after an explicit
+	// ts.ensure_parameter_values_partitions call (the history generator).
+	maxPartitionMonthsBack = 24
+)
+
+// partitionWindow returns the first and the last month (first day, UTC) whose
+// ts.parameter_values partitions must exist at now: from the month that
+// contains the start of the retention window (the current month when
+// retention is off, at most maxPartitionMonthsBack months back) to
+// partitionMonthsAhead months after the current one.
+func partitionWindow(now time.Time, retentionDays int) (from, to time.Time) {
+	now = now.UTC()
+	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	from = month
+	if retentionDays > 0 {
+		start := now.AddDate(0, 0, -retentionDays)
+		from = time.Date(start.Year(), start.Month(), 1, 0, 0, 0, 0, time.UTC)
+		if limit := month.AddDate(0, -maxPartitionMonthsBack, 0); from.Before(limit) {
+			from = limit
+		}
+	}
+	return from, month.AddDate(0, partitionMonthsAhead, 0)
+}
+
+// MaintainPartitions creates the missing monthly partitions of
+// ts.parameter_values (there is no default partition: a logged value without
+// a partition is rejected). Idempotent and safe to run concurrently; the
+// server also calls it at start-up, before the engine starts.
+func (s *Scheduler) MaintainPartitions(ctx context.Context) error {
+	from, to := partitionWindow(time.Now(), s.d.RetentionDays)
+	var created int
+	if err := s.d.DB.QueryRow(ctx, `SELECT ts.ensure_parameter_values_partitions($1::date, $2::date)`,
+		from.Format(time.DateOnly), to.Format(time.DateOnly)).Scan(&created); err != nil {
+		return fmt.Errorf("ensure parameter value partitions %s..%s: %w", from.Format("2006-01"), to.Format("2006-01"), err)
+	}
+	if created > 0 {
+		slog.Info("created parameter value partitions", "count", created, "from", from.Format("2006-01"), "to", to.Format("2006-01"))
+	}
+	return nil
 }
 
 // Jobs returns the configured jobs (used by tests).
@@ -320,29 +375,38 @@ func (s *Scheduler) checkLicenses(ctx context.Context) error {
 }
 
 // retention removes raw measurements and notifications older than the
-// retention period in small batches to keep locks short.
+// retention period. Measurements are partitioned by month, so whole months
+// that ended before the cutoff are dropped (never a ctid delete on the
+// partitioned table: ctids repeat across partitions); the other tables are
+// deleted from in small batches to keep locks short.
 func (s *Scheduler) retention(ctx context.Context) error {
 	if s.d.RetentionDays <= 0 {
 		return nil
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -s.d.RetentionDays)
+	var errs []error
+	var dropped int
+	if err := s.d.DB.QueryRow(ctx, `SELECT ts.drop_parameter_values_partitions_before($1)`, cutoff).Scan(&dropped); err != nil {
+		errs = append(errs, fmt.Errorf("drop parameter value partitions: %w", err))
+	} else if dropped > 0 {
+		slog.Info("retention dropped parameter value partitions", "count", dropped, "cutoff", cutoff.Format(time.RFC3339))
+	}
 	for _, q := range []string{
-		`DELETE FROM ts.parameter_values WHERE ctid = ANY(ARRAY(SELECT ctid FROM ts.parameter_values WHERE ts < $1 LIMIT 20000))`,
 		`DELETE FROM core.notifications WHERE id = ANY(ARRAY(SELECT id FROM core.notifications WHERE created_at < $1 LIMIT 5000))`,
 		`DELETE FROM ts.asset_condition WHERE ctid = ANY(ARRAY(SELECT ctid FROM ts.asset_condition WHERE end_ts IS NOT NULL AND end_ts < $1 LIMIT 20000))`,
 	} {
 		for {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return errors.Join(append(errs, ctx.Err())...)
 			}
 			tag, err := s.d.DB.Exec(ctx, q, cutoff)
 			if err != nil {
-				return err
+				return errors.Join(append(errs, err)...)
 			}
 			if tag.RowsAffected() == 0 {
 				break
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
