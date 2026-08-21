@@ -53,6 +53,10 @@ type Engine struct {
 	ewMu      sync.Mutex
 	ewRecent  map[string]time.Time
 	lastError map[int64]string
+
+	// External FDD alarms (analytics.faults), see external.go.
+	extMu sync.Mutex
+	ext   externalState
 }
 
 type openEvent struct {
@@ -163,6 +167,7 @@ func (e *Engine) cycle(ctx context.Context) {
 		return
 	}
 	now := time.Now().UTC()
+	e.refreshExternal(ctx, now)
 	ids := make([]int64, 0, len(snap.Equipment))
 	for id := range snap.Equipment {
 		ids = append(ids, id)
@@ -340,6 +345,7 @@ func (e *Engine) evaluateEquipment(ctx context.Context, snap *Snapshot, eq *Equi
 		offline := e.isOffline(eq, now)
 		res = e.eval.Evaluate(snap.Models[eq.ModelID], eq.Params, values, eq.ForcedState, offline)
 	}
+	appendExternal(&res, e.externalAlarms(eq.ID))
 	if len(res.Errors) > 0 {
 		msg := strings.Join(res.Errors, "; ")
 		e.ewMu.Lock()
