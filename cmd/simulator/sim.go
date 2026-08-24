@@ -17,18 +17,26 @@ type Plant struct {
 	ByAlias map[string]*Asset
 	Models  map[string]*ModelSpec
 	Env     Env
+	// Truth holds the true values of the last step (Step returns the
+	// measured ones); simulation jobs keep both.
+	Truth map[*Asset]map[string]float64
+	// EnvHook adjusts the environment of every step (simulation jobs: weather
+	// offsets, load scale, the fixed conditions of a DOE sample).
+	EnvHook func(t time.Time, env *Env)
 	loc     *time.Location
 	weather *Weather
 	anchor  time.Time
 	rng     *rand.Rand
 	defs    map[string]map[string]*engine.ParamDef // model -> alias -> thresholds
+	sys     *Asset                                 // the plant controller (CHWS_01)
+	groups  map[string][]*Asset
 }
 
 func newPlant(seed uint64, loc *time.Location) *Plant {
 	r := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 	p := &Plant{ByAlias: map[string]*Asset{}, Models: map[string]*ModelSpec{}, loc: loc, rng: r,
 		weather: newWeather(rand.New(rand.NewPCG(r.Uint64(), r.Uint64()))), defs: map[string]map[string]*engine.ParamDef{},
-		anchor: time.Date(2026, 1, 5, 8, 0, 0, 0, loc)}
+		anchor: time.Date(2026, 1, 5, 8, 0, 0, 0, loc), groups: map[string][]*Asset{}}
 	for _, m := range models() {
 		p.Models[m.Name] = m
 		defs := map[string]*engine.ParamDef{}
@@ -61,10 +69,19 @@ func newPlant(seed uint64, loc *time.Location) *Plant {
 		m := p.Models[e.Model]
 		a := newAsset(e, m, idx[e.Group], rand.New(rand.NewPCG(r.Uint64(), r.Uint64())))
 		idx[e.Group]++
-		p.Assets = append(p.Assets, a)
-		p.ByAlias[e.Alias] = a
+		p.addAsset(a)
 	}
 	return p
+}
+
+// addAsset registers an asset (in equipment order).
+func (p *Plant) addAsset(a *Asset) {
+	p.Assets = append(p.Assets, a)
+	p.ByAlias[a.Spec.Alias] = a
+	p.groups[a.Spec.Group] = append(p.groups[a.Spec.Group], a)
+	if a.Kind == "chws" {
+		p.sys = a
+	}
 }
 
 // pick returns a random asset accepted by ok (nil accepts any).
@@ -80,15 +97,9 @@ func (p *Plant) pick(r *rand.Rand, ok func(*Asset) bool) *Asset {
 // physical reports whether an asset is real equipment (not a BMS system view).
 func physical(a *Asset) bool { return a.Spec.Group != "system" }
 
-func (p *Plant) group(g string) []*Asset {
-	var out []*Asset
-	for _, a := range p.Assets {
-		if a.Spec.Group == g {
-			out = append(out, a)
-		}
-	}
-	return out
-}
+// group returns the assets of an equipment group in equipment order (shared
+// slice: do not modify).
+func (p *Plant) group(g string) []*Asset { return p.groups[g] }
 
 // Run modes of equipment with a run_mode control (chillers): Auto leaves the
 // unit to the duty controller, On (hand) runs it, Off locks it out.
@@ -98,7 +109,9 @@ const (
 	runOff  = 2
 )
 
-// updateDuty runs the N+1 duty/standby controllers (weekly rotation).
+// updateDuty runs the duty/standby controllers: the plant controller's duty
+// chiller count (load staging, normally N+1) with a weekly rotation of the
+// units.
 func (p *Plant) updateDuty(t time.Time) {
 	week := int(t.Sub(p.anchor).Hours() / 168)
 	if week < 0 {
@@ -142,7 +155,7 @@ func (p *Plant) updateDuty(t time.Time) {
 		}
 		return true
 	}
-	ch := assign("chillers", 2, pumpsOK)
+	ch := assign("chillers", p.dutyChillers(), pumpsOK)
 	assign("towers", ch, nil)
 	assign("pcw", 3, nil)
 	// Dedicated primary pumps: CHWP-0n / CWP-0n run with chiller CH-0n.
@@ -159,62 +172,167 @@ func (p *Plant) updateDuty(t time.Time) {
 	}
 }
 
-// Step advances the plant and returns the values of every asset.
+// Step advances the plant by dt seconds to t and returns the measured values
+// of every asset (sensor faults applied); the true values stay in p.Truth.
+// Order: weather and load, duty (staging), the plant controller and its
+// loops, the equipment physics, the plant-level points, the sensors.
 func (p *Plant) Step(t time.Time, dt float64) map[*Asset]map[string]float64 {
-	p.updateDuty(t)
 	env := p.weather.at(t, p.loc, dt)
+	if p.EnvHook != nil {
+		p.EnvHook(t, &env)
+	}
+	env.FabLoad = env.Load * 2 * chillerCapKW
+	// the fab coils see the CHW supply and riser DP of the previous step
+	env.CHWS, env.RiserDP = defCHWSP, defRiserDPSP
+	if s := p.sys; s != nil && s.last != nil {
+		env.CHWS, env.RiserDP = s.last["chws_temp"], s.last["riser_dp"]
+	}
+	p.Env = env
+	p.updateDuty(t)
 	nCh := 0
 	for _, a := range p.group("chillers") {
 		if a.Running() {
 			nCh++
 		}
 	}
-	if nCh == 0 {
-		nCh = 1
-	}
-	env.ChillerLoad = clamp(env.Load*2/float64(nCh), 0.2, 1)
-	// each chiller's evaporator / condenser flow follows its dedicated pumps
-	chwp, cwp := p.group("chwp"), p.group("cwp")
-	for i, c := range p.group("chillers") {
-		c.ChwK, c.CwK = pumpSpeedRatio(chwp, i), pumpSpeedRatio(cwp, i)
-	}
-	sum, n := 0.0, 0
-	for _, a := range p.group("towers") {
-		if a.Running() && a.last != nil {
-			sum += a.last["cwst"]
-			n++
-		}
-	}
-	if n > 0 {
-		env.CWS = sum / float64(n)
-	} else {
-		env.CWS = env.WetBulb + 3.4
-	}
+	env.ChillerLoad = clamp(env.FabLoad/(float64(max(nCh, 1))*chillerCapKW), 0.2, 1)
+	p.supervise(t, &env, dt)
 	p.Env = env
-	out := make(map[*Asset]map[string]float64, len(p.Assets))
+	truth := make(map[*Asset]map[string]float64, len(p.Assets))
 	for _, a := range p.Assets {
-		out[a] = a.Values(t, env, dt)
+		truth[a] = a.Values(t, env, dt)
 	}
 	// plant-level (BMS) points are derived from the equipment values
-	for _, a := range p.Assets {
-		if a.Kind == "chws" {
-			a.chwSystem(out[a], p, out, dt)
-		}
+	if s := p.sys; s != nil {
+		s.chwSystem(truth[s], p, truth, env, dt)
 	}
-	return out
+	meas := make(map[*Asset]map[string]float64, len(p.Assets))
+	for _, a := range p.Assets {
+		a.meas = a.sense(truth[a])
+		meas[a] = a.meas
+	}
+	p.Truth = truth
+	return meas
 }
 
-// pumpSpeedRatio is the speed of pump i of a group relative to its design
-// speed (its last value; 1 when it does not run or has no value yet).
-func pumpSpeedRatio(g []*Asset, i int) float64 {
-	if i >= len(g) || !g[i].Running() || g[i].last == nil {
-		return 1
+// ---------------------------------------------------------------------------
+// Faults, trips and communication losses (shared by the live simulation, the
+// history and the simulation jobs)
+
+// evolution lists what changed while faults, trips and communication evolved.
+type evolution struct {
+	Tripped, TripReset, Restored []*Asset
+}
+
+// evolve advances fault severities, the MAU filter loading, communication
+// losses and trips by dt seconds to now; tripFor draws how long a new trip
+// lasts until the operator resets it.
+func (p *Plant) evolve(now time.Time, dt float64, tripFor func(a *Asset) time.Duration) evolution {
+	var ev evolution
+	for _, a := range p.Assets {
+		for _, f := range a.Faults {
+			f.Sev = math.Min(maxSeverity, f.Sev+f.Rate*dt)
+		}
+		if a.Kind == "mau" {
+			a.FilterDays += dt / 86400
+		}
+		if a.Offline && now.After(a.OffUntil) {
+			a.Offline = false
+			ev.Restored = append(ev.Restored, a)
+		}
+		if !a.SpikeUntil.IsZero() && now.After(a.SpikeUntil) {
+			a.SpikeUntil = time.Time{}
+			a.Trip = true
+			a.TripUntil = now.Add(tripFor(a))
+			ev.Tripped = append(ev.Tripped, a)
+		}
+		if a.Trip && !a.TripUntil.IsZero() && now.After(a.TripUntil) {
+			a.Trip = false
+			a.TripUntil = time.Time{}
+			ev.TripReset = append(ev.TripReset, a)
+		}
 	}
-	r := pumpRatings[g[i].Kind]
-	if r.SpeedHz <= 0 || g[i].last["speed"] <= 0 {
-		return 1
+	return ev
+}
+
+// injectRandomFault starts a random developing fault (never a Manual one) on
+// a random running asset that does not have it yet; it develops fully in
+// rampMin .. rampMax minutes.
+func (p *Plant) injectRandomFault(r *rand.Rand, now time.Time, rampMin, rampMax float64) (*Asset, *FaultSpec, float64) {
+	for tries := 0; tries < 20; tries++ {
+		a := p.Assets[r.IntN(len(p.Assets))]
+		cands := a.Model.randomFaults()
+		if !a.Running() || len(cands) == 0 {
+			continue
+		}
+		f := cands[r.IntN(len(cands))]
+		if a.Faults[f.Kind] != nil {
+			continue
+		}
+		ramp := (rampMin + r.Float64()*(rampMax-rampMin)) * 60
+		a.Faults[f.Kind] = &Fault{Kind: f.Kind, Rate: 1.25 / ramp, Start: now}
+		return a, a.Model.faultSpec(f.Kind), ramp
 	}
-	return clamp(g[i].last["speed"]/r.SpeedHz, 0.5, 1.2)
+	return nil, nil, 0
+}
+
+// injectRandomTrip makes a random running asset spike and trip 45 s later.
+func (p *Plant) injectRandomTrip(r *rand.Rand, now time.Time) *Asset {
+	for tries := 0; tries < 20; tries++ {
+		a := p.Assets[r.IntN(len(p.Assets))]
+		if !a.Running() || a.Trip || len(a.Model.Trips) == 0 {
+			continue
+		}
+		a.startTrip(now)
+		return a
+	}
+	return nil
+}
+
+// startTrip starts the overload spike that trips the asset 45 s later.
+func (a *Asset) startTrip(now time.Time) bool {
+	if len(a.Model.Trips) == 0 {
+		return false
+	}
+	ts := a.Model.Trips[0]
+	a.TripSpec = &ts
+	a.SpikeUntil = now.Add(45 * time.Second)
+	return true
+}
+
+// injectFault starts a fault of the asset's model on demand. A fixed-
+// intensity (LBNL) fault takes value as its intensity, which must lie within
+// the documented intensities; a developing fault takes value as a fixed
+// severity (0 .. maxSeverity), or develops from 0 at rate when value is 0.
+func (a *Asset) injectFault(kind string, value float64, now time.Time, rate float64) (*Fault, error) {
+	fs := a.Model.faultSpec(kind)
+	if fs == nil {
+		return nil, fmt.Errorf("%s has no fault %q", a.Spec.Alias, kind)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, fmt.Errorf("invalid %s value", kind)
+	}
+	f := &Fault{Kind: kind, Start: now}
+	if len(fs.Intensities) > 0 {
+		lo, hi := fs.Intensities[0], fs.Intensities[0]
+		for _, x := range fs.Intensities {
+			lo, hi = math.Min(lo, x), math.Max(hi, x)
+		}
+		if value == 0 || value < lo-1e-9 || value > hi+1e-9 {
+			return nil, fmt.Errorf("%s intensity %v outside %v .. %v", kind, value, fnum(lo), fnum(hi))
+		}
+		f.Value, f.Sev = value, 1
+	} else {
+		if value < 0 || value > maxSeverity {
+			return nil, fmt.Errorf("%s severity %v outside 0 .. %v", kind, value, maxSeverity)
+		}
+		f.Sev = value
+		if value == 0 {
+			f.Rate = rate
+		}
+	}
+	a.Faults[kind] = f
+	return f, nil
 }
 
 // controlSpec returns the parameter definition of a writable parameter.
