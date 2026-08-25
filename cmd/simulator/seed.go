@@ -146,6 +146,11 @@ func (s *Seeder) models(ctx context.Context) error {
 			}
 			id = s.modelID(ctx, m.Name)
 		}
+		// descriptions follow the definition (e.g. the plant controller now
+		// covers the CHW and CW loops)
+		if _, err := s.db.Exec(ctx, `UPDATE asset.models SET description = $2 WHERE id = $1 AND description IS DISTINCT FROM $2`, id, m.Description); err != nil {
+			return fmt.Errorf("description of %s: %w", m.Name, err)
+		}
 		if m.Base != "" {
 			// Extended models inherit variables, alarms and status scripts;
 			// only overrides are applied.
