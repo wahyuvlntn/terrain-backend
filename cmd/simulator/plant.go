@@ -203,6 +203,103 @@ type FaultSpec struct {
 	Label string
 	// Codes whose completed maintenance repairs the fault.
 	Codes []string
+	// Manual faults (the fixed-intensity LBNL faults) are injected on demand
+	// only: never at random in the live plant and never sped up when the live
+	// simulation starts. The history plans a few labelled episodes of each.
+	Manual bool
+	// Intensities are the documented fault intensities (Fault.Value); Unit is
+	// their unit. Faults without intensities develop a severity instead.
+	Intensities []float64
+	Unit        string
+}
+
+// fault is a degradation that develops over time (severity 0 .. maxSeverity).
+func fault(kind, label string, codes ...string) FaultSpec {
+	return FaultSpec{Kind: kind, Label: label, Codes: codes}
+}
+
+// lbnl is a fixed-intensity fault of the LBNL chiller plant FDD data set,
+// injected on demand with one of its documented intensities.
+func lbnl(kind, label, unit string, intensities []float64, codes ...string) FaultSpec {
+	return FaultSpec{Kind: kind, Label: label, Codes: codes, Manual: true, Intensities: intensities, Unit: unit}
+}
+
+// fddRelation is the issue relation of an external FDD alarm (an analytics
+// rule code the engine raises as an alarm): the active code itself leads to a
+// corrective early-warning order that carries the code's SOPs.
+func fddRelation(code string) RelationSpec {
+	return RelationSpec{Name: codeName(code) + " (FDD)", Target: code, Paths: [][]string{{"A:" + code}}}
+}
+
+// faultSpec returns the model's definition of a fault kind (nil when unknown).
+func (m *ModelSpec) faultSpec(kind string) *FaultSpec {
+	for i := range m.Faults {
+		if m.Faults[i].Kind == kind {
+			return &m.Faults[i]
+		}
+	}
+	return nil
+}
+
+// FaultCatalogEntry is one injectable fault kind of a model (the shape of the
+// backend's simulation/getfaultcatalog). Intensities are empty for the
+// developing faults, whose value is a fixed severity (0 .. 1.35; 0 = develops
+// at the live pace).
+type FaultCatalogEntry struct {
+	Kind        string    `json:"kind"`
+	AssetKind   string    `json:"asset_kind"`
+	Assets      []string  `json:"assets"`
+	Intensities []float64 `json:"intensities"`
+	Unit        string    `json:"unit"`
+	Label       string    `json:"label"`
+	Code        string    `json:"code"`
+	Manual      bool      `json:"manual"`
+}
+
+// faultCatalog lists every fault kind of the plant's models with the units
+// that can take it (LBNL faults first).
+func faultCatalog(p *Plant) []FaultCatalogEntry {
+	var lbnlFaults, others []FaultCatalogEntry
+	for _, m := range models() {
+		var units []string
+		for _, a := range p.Assets {
+			if a.Model.Name == m.Name {
+				units = append(units, a.Spec.Alias)
+			}
+		}
+		if len(units) == 0 {
+			continue
+		}
+		for _, f := range m.Faults {
+			e := FaultCatalogEntry{Kind: f.Kind, AssetKind: m.Key, Assets: units, Intensities: f.Intensities, Unit: f.Unit, Label: f.Label, Manual: f.Manual}
+			if e.Intensities == nil {
+				e.Intensities = []float64{}
+			}
+			if !f.Manual {
+				e.Unit = "severity"
+			}
+			if len(f.Codes) > 0 {
+				e.Code = f.Codes[0]
+			}
+			if f.Manual {
+				lbnlFaults = append(lbnlFaults, e)
+			} else {
+				others = append(others, e)
+			}
+		}
+	}
+	return append(lbnlFaults, others...)
+}
+
+// randomFaults returns the faults that may develop at random (not Manual).
+func (m *ModelSpec) randomFaults() []FaultSpec {
+	var out []FaultSpec
+	for _, f := range m.Faults {
+		if !f.Manual {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // TripSpec is a sudden trip (unplanned down).
@@ -265,7 +362,14 @@ var issueCategories = []issueCategory{
 	{"Water Side", [][2]string{{"WTR-01", "Flow"}, {"WTR-02", "Pressure"}, {"WTR-03", "Water Quality"}, {"WTR-04", "Level"}}},
 	{"Electrical", [][2]string{{"ELE-01", "Motor Overcurrent"}}},
 	{"Process Utilities", [][2]string{{"PRC-01", "By-product Deposition"}, {"PRC-02", "Purge Gas"}, {"PRC-03", "Vacuum Performance"}, {"PRC-04", "Compressed Air Quality"}}},
+	{"Sensors & Controls", [][2]string{{"SEN-01", "Sensor Bias / Calibration"}, {"CTL-01", "Control Loop Tuning"}, {"VLV-01", "Valve Leakage / Stuck"}}},
 }
+
+// fddCodes are the alarm codes of the LBNL fault detection rules (analytics
+// rule code = alarm code); the engine raises them as external alarms.
+var fddCodes = []string{"CHL-011", "CT-013", "CT-014", "CHS-005", "CHS-006", "CHS-007", "CHS-008"}
+
+func isFDDCode(code string) bool { return contains(fddCodes, code) }
 
 // alarmCodes lists every alarm code (master data, "CODE - Name").
 var alarmCodes = [][2]string{
@@ -279,6 +383,7 @@ var alarmCodes = [][2]string{
 	{"CHL-008", "Chilled Water Supply Temperature Deviation"},
 	{"CHL-009", "High Compressor Vibration"},
 	{"CHL-010", "Compressor Bearing Wear"},
+	{"CHL-011", "Chiller CHW Leaving Temperature Sensor Bias"},
 	{"AHU-001", "High Pre-Filter Differential Pressure"},
 	{"AHU-002", "High HEPA Filter Differential Pressure"},
 	{"AHU-003", "Supply Air Temperature Deviation"},
@@ -296,6 +401,8 @@ var alarmCodes = [][2]string{
 	{"CT-010", "Fan Gearbox / Bearing Failure"},
 	{"CT-011", "Fill Media Scaling"},
 	{"CT-012", "Make-up Water Valve Fault"},
+	{"CT-013", "Tower Leaving Water Temperature Sensor Bias"},
+	{"CT-014", "Cooling Tower Heat Exchanger Fouling"},
 	{"PMP-001", "Low Suction Pressure"},
 	{"PMP-002", "High Pump Vibration"},
 	{"PMP-003", "High Bearing Temperature"},
@@ -324,6 +431,10 @@ var alarmCodes = [][2]string{
 	{"CHS-002", "Low Riser Differential Pressure"},
 	{"CHS-003", "Low CHW Delta T"},
 	{"CHS-004", "Poor Chiller Plant Efficiency"},
+	{"CHS-005", "Riser Differential Pressure Sensor Bias"},
+	{"CHS-006", "Condenser 3-Way Valve Leakage"},
+	{"CHS-007", "Condenser 3-Way Valve Stuck"},
+	{"CHS-008", "CW Supply Temperature Loop Hunting (PI Tuning)"},
 	{"PM-CHL", "Chiller Monthly Preventive Maintenance"},
 	{"PM-MAU", "MAU Monthly Filter and Fan Service"},
 	{"PM-CT", "Cooling Tower Monthly Maintenance"},
@@ -353,6 +464,7 @@ func chillerModel() *ModelSpec {
 		numP("chwst", "Chilled Water Supply Temp", "°C", 2),
 		numP("chwrt", "Chilled Water Return Temp", "°C", 2),
 		numP("chw_flow", "Chilled Water Flow", "m³/h", 0),
+		numP("cond_flow", "Condenser Water Flow", "m³/h", 0),
 		numP("cwet", "Condenser Water Entering Temp", "°C", 2),
 		numP("cwlt", "Condenser Water Leaving Temp", "°C", 2),
 		numP("evap_press", "Evaporator Pressure", "kPa", 0).W("<", 325),
@@ -388,11 +500,13 @@ func chillerModel() *ModelSpec {
 			{"Condenser Tube Fouling Diagnosis", "CHL-005", [][]string{{"A:CHL-007", "P:cond_press"}, {"A:CHL-001"}}},
 			{"Refrigerant Leak Detection", "CHL-006", [][]string{{"P:superheat", "P:evap_approach"}, {"A:CHL-002"}}},
 			{"Compressor Bearing Degradation", "CHL-010", [][]string{{"A:CHL-009", "P:oil_temp"}, {"A:CHL-004"}}},
+			fddRelation("CHL-011"),
 		},
 		Faults: []FaultSpec{
-			{"cond_fouling", "Condenser tube fouling", []string{"CHL-005", "CHL-001", "CHL-007"}},
-			{"refrigerant_leak", "Refrigerant leak", []string{"CHL-006", "CHL-002", "CHL-008"}},
-			{"bearing_wear", "Compressor bearing wear", []string{"CHL-010", "CHL-009", "CHL-004"}},
+			fault("cond_fouling", "Condenser tube fouling", "CHL-005", "CHL-001", "CHL-007"),
+			fault("refrigerant_leak", "Refrigerant leak", "CHL-006", "CHL-002", "CHL-008"),
+			fault("bearing_wear", "Compressor bearing wear", "CHL-010", "CHL-009", "CHL-004"),
+			lbnl("chwst_bias", "CHW leaving temperature sensor bias", "K", []float64{-2, -1, 1, 2}, "CHL-011"),
 		},
 		Trips:  []TripSpec{{"CHL-003", "discharge_temp", 71, "Chiller tripped on high compressor discharge temperature"}},
 		PMCode: "PM-CHL", PMRepeat: 3, PMHours: 4,
@@ -402,6 +516,7 @@ func chillerModel() *ModelSpec {
 			"CHL-003": {"discharge_temp", "cond_press"}, "CHL-004": {"oil_dp", "oil_temp"}, "CHL-005": {"cond_approach", "cond_press", "cwlt", "efficiency"},
 			"CHL-006": {"evap_press", "superheat", "evap_approach", "chwst"}, "CHL-007": {"cond_approach", "cwlt"},
 			"CHL-008": {"chwst", "chwst_asp", "chwst_sp", "chwrt", "load_pct"}, "CHL-009": {"vibration"}, "CHL-010": {"vibration", "oil_temp", "oil_dp", "motor_current"},
+			"CHL-011": {"chwst", "chwrt", "chw_flow", "load_pct", "chwst_asp"},
 		},
 	}
 }
@@ -438,9 +553,9 @@ func mauModel() *ModelSpec {
 			{"Fan Drive Slippage", "AHU-012", [][]string{{"A:AHU-006", "P:fan_speed"}}},
 		},
 		Faults: []FaultSpec{
-			{"filter_clog", "Pre-filter clogging", []string{"AHU-010", "AHU-001", "PM-MAU"}},
-			{"coil_fouling", "Cooling coil fouling", []string{"AHU-011", "AHU-003", "AHU-004"}},
-			{"belt_slip", "Fan belt slippage", []string{"AHU-012", "AHU-006"}},
+			fault("filter_clog", "Pre-filter clogging", "AHU-010", "AHU-001", "PM-MAU"),
+			fault("coil_fouling", "Cooling coil fouling", "AHU-011", "AHU-003", "AHU-004"),
+			fault("belt_slip", "Fan belt slippage", "AHU-012", "AHU-006"),
 		},
 		Trips:  []TripSpec{{"AHU-005", "fan_current", 66, "Fan VFD tripped on motor overcurrent"}},
 		PMCode: "PM-MAU", PMRepeat: 3, PMHours: 3,
@@ -460,6 +575,7 @@ func coolingTowerModel() *ModelSpec {
 		numP("approach", "Tower Approach", "K", 2).W(">", 5.0).C(">", 6.5),
 		numP("fan_speed", "Fan Speed", "%", 1),
 		numP("fan_current", "Fan Motor Current", "A", 1).W(">", 45),
+		numP("fan_power", "Fan Power", "kW", 1),
 		numP("fan_vibration", "Fan Gearbox Vibration", "mm/s", 2).W(">", 4.5).C(">", 7.1),
 		numP("basin_level", "Basin Water Level", "%", 0).W("<", 55).C("<", 40),
 		numP("conductivity", "Water Conductivity", "µS/cm", 0).W(">", 2200).C(">", 2600),
@@ -481,11 +597,15 @@ func coolingTowerModel() *ModelSpec {
 			{"Fan Drive Train Failure", "CT-010", [][]string{{"A:CT-002"}, {"P:fan_vibration", "P:fan_current"}}},
 			{"Fill Scaling Diagnosis", "CT-011", [][]string{{"P:approach", "P:conductivity"}, {"A:CT-005"}}},
 			{"Make-up Water Supply Fault", "CT-012", [][]string{{"A:CT-004"}, {"P:basin_level"}}},
+			fddRelation("CT-013"),
+			fddRelation("CT-014"),
 		},
 		Faults: []FaultSpec{
-			{"gearbox_wear", "Fan gearbox wear", []string{"CT-010", "CT-002"}},
-			{"fill_scaling", "Fill media scaling", []string{"CT-011", "CT-005", "CT-003", "CT-001"}},
-			{"makeup_valve", "Make-up valve fault", []string{"CT-012", "CT-004"}},
+			fault("gearbox_wear", "Fan gearbox wear", "CT-010", "CT-002"),
+			fault("fill_scaling", "Fill media scaling", "CT-011", "CT-005", "CT-003", "CT-001"),
+			fault("makeup_valve", "Make-up valve fault", "CT-012", "CT-004"),
+			lbnl("cwst_bias", "Tower leaving water temperature sensor bias", "K", []float64{-2, -1, 1, 2}, "CT-013"),
+			lbnl("ct_fouling", "Tower heat exchanger fouling (capacity factor)", "capacity factor", []float64{0.95, 0.80, 0.65}, "CT-014"),
 		},
 		Trips:  []TripSpec{{"CT-002", "", 0, "Fan tripped on vibration switch"}},
 		PMCode: "PM-CT", PMRepeat: 3, PMHours: 3,
@@ -493,6 +613,7 @@ func coolingTowerModel() *ModelSpec {
 			"CT-001": {"cwst", "wet_bulb", "approach"}, "CT-002": {"fan_vibration", "fan_current"}, "CT-003": {"conductivity"},
 			"CT-004": {"basin_level"}, "CT-005": {"approach", "fan_speed"}, "CT-010": {"fan_vibration", "fan_current"},
 			"CT-011": {"approach", "conductivity", "cwst"}, "CT-012": {"basin_level"},
+			"CT-013": {"cwst", "cwrt", "approach", "fan_speed"}, "CT-014": {"approach", "fan_speed", "fan_power", "cwst", "wet_bulb"},
 		},
 	}
 }
@@ -507,11 +628,20 @@ type PumpRating struct {
 	MinFlow  float64 // low-flow alarm
 	SuctWarn float64 // low suction pressure warning / critical (cavitation)
 	SuctCrit float64
+	// Spec is the normal specific energy (kWh/m³) the specific energy alarms
+	// are scaled from; 0 = the rated point (PowerKW / Flow).
+	Spec float64
 }
 
 var pumpRatings = map[string]PumpRating{
-	"pcw":  {Flow: 318, DP: 4.2, PowerKW: 52, Suction: 2.05, SpeedHz: 48, MinFlow: 220, SuctWarn: 1.4, SuctCrit: 1.0},
-	"chwp": {Flow: 550, DP: 3.1, PowerKW: 58, Suction: 2.6, SpeedHz: 46, MinFlow: 420, SuctWarn: 1.9, SuctCrit: 1.5},
+	"pcw": {Flow: 318, DP: 4.2, PowerKW: 52, Suction: 2.05, SpeedHz: 48, MinFlow: 220, SuctWarn: 1.4, SuctCrit: 1.0},
+	// Variable primary: the CHW pumps follow the riser DP and the minimum-flow
+	// bypass holds 60 % of the design chiller flow (330 m³/h), so the low-flow
+	// alarm sits just below what normal operation reaches. They run well below
+	// their rated head (about 0.061 kWh/m³ at the design load, at most 0.076 at
+	// full speed): the specific energy alarms (0.080 / 0.096) are scaled from
+	// that operating point, so a worn impeller shows before the riser DP sags.
+	"chwp": {Flow: 550, DP: 3.1, PowerKW: 58, Suction: 2.6, SpeedHz: 46, MinFlow: 320, SuctWarn: 1.9, SuctCrit: 1.5, Spec: 0.064},
 	"cwp":  {Flow: 640, DP: 2.4, PowerKW: 54, Suction: 1.6, SpeedHz: 47, MinFlow: 500, SuctWarn: 1.1, SuctCrit: 0.8},
 }
 
@@ -521,6 +651,9 @@ func pumpModel(key, name, typ, series, desc, label string) *ModelSpec {
 	r := pumpRatings[key]
 	amps := r.PowerKW * 1000 / (1.732 * 400 * 0.88)
 	spec := r.PowerKW / r.Flow
+	if r.Spec > 0 {
+		spec = r.Spec
+	}
 	round := func(v float64, d int) float64 { k := math.Pow(10, float64(d)); return math.Round(v*k) / k }
 	p := append(statusParams(),
 		numP("speed", "Pump Speed", "Hz", 1),
@@ -528,6 +661,7 @@ func pumpModel(key, name, typ, series, desc, label string) *ModelSpec {
 		numP("discharge_press", "Discharge Pressure", "bar", 2),
 		numP("flow", "Flow Rate", "m³/h", 1),
 		numP("motor_current", "Motor Current", "A", 1).W(">", round(amps*1.15, 0)),
+		numP("power_kw", "Input Power", "kW", 1),
 		numP("spec_energy", "Specific Energy", "kWh/m³", 3).W(">", round(spec*1.25, 3)).C(">", round(spec*1.5, 3)),
 		numP("vibration", "Pump Vibration", "mm/s", 2).W(">", 4.5).C(">", 7.1),
 		numP("bearing_temp", "Bearing Temperature", "°C", 1).W(">", 75).C(">", 85),
@@ -552,9 +686,9 @@ func pumpModel(key, name, typ, series, desc, label string) *ModelSpec {
 			{label + " Impeller Wear Detection", "PMP-012", [][]string{{"A:PMP-004"}, {"P:spec_energy"}}},
 		},
 		Faults: []FaultSpec{
-			{"cavitation", "Suction strainer clogging / cavitation", []string{"PMP-010", "PMP-001"}},
-			{"bearing_wear", "Pump bearing wear", []string{"PMP-011", "PMP-002", "PMP-003"}},
-			{"impeller_wear", "Impeller wear", []string{"PMP-012", "PMP-004"}},
+			fault("cavitation", "Suction strainer clogging / cavitation", "PMP-010", "PMP-001"),
+			fault("bearing_wear", "Pump bearing wear", "PMP-011", "PMP-002", "PMP-003"),
+			fault("impeller_wear", "Impeller wear", "PMP-012", "PMP-004"),
 		},
 		Trips:  []TripSpec{{"PMP-005", "motor_current", round(amps*1.35, 0), "Pump tripped on motor overload"}},
 		PMCode: "PM-PCW", PMRepeat: 3, PMHours: 2,
@@ -595,9 +729,9 @@ func pcwPumpModel() *ModelSpec {
 			{"Impeller Wear Detection", "PMP-012", [][]string{{"A:PMP-004"}, {"P:spec_energy"}}},
 		},
 		Faults: []FaultSpec{
-			{"cavitation", "Suction strainer clogging / cavitation", []string{"PMP-010", "PMP-001"}},
-			{"bearing_wear", "Pump bearing wear", []string{"PMP-011", "PMP-002", "PMP-003"}},
-			{"impeller_wear", "Impeller wear", []string{"PMP-012", "PMP-004"}},
+			fault("cavitation", "Suction strainer clogging / cavitation", "PMP-010", "PMP-001"),
+			fault("bearing_wear", "Pump bearing wear", "PMP-011", "PMP-002", "PMP-003"),
+			fault("impeller_wear", "Impeller wear", "PMP-012", "PMP-004"),
 		},
 		Trips:  []TripSpec{{"PMP-005", "motor_current", 132, "Pump tripped on motor overload"}},
 		PMCode: "PM-PCW", PMRepeat: 3, PMHours: 2,
@@ -648,9 +782,9 @@ func compressorModel() *ModelSpec {
 			{"Distribution Leak Detection", "CDA-012", [][]string{{"P:load_pct", "P:discharge_press"}, {"A:CDA-002"}}},
 		},
 		Faults: []FaultSpec{
-			{"intercooler_fouling", "Intercooler fouling", []string{"CDA-010", "CDA-005", "CDA-001"}},
-			{"dryer_fault", "Desiccant dryer malfunction", []string{"CDA-011", "CDA-003"}},
-			{"air_leak", "Compressed air leak", []string{"CDA-012", "CDA-002"}},
+			fault("intercooler_fouling", "Intercooler fouling", "CDA-010", "CDA-005", "CDA-001"),
+			fault("dryer_fault", "Desiccant dryer malfunction", "CDA-011", "CDA-003"),
+			fault("air_leak", "Compressed air leak", "CDA-012", "CDA-002"),
 		},
 		Trips:  []TripSpec{{"CDA-004", "motor_current", 640, "Compressor tripped on motor overload"}},
 		PMCode: "PM-CDA", PMRepeat: 3, PMHours: 4,
@@ -702,9 +836,9 @@ func dryPumpModel(name, desc string, overrides map[string]CondSpec) *ModelSpec {
 		{"N2 Purge Blockage", "VAC-012", [][]string{{"A:VAC-004"}, {"P:n2_flow"}}},
 	}
 	m.Faults = []FaultSpec{
-		{"deposition", "Process by-product deposition", []string{"VAC-010", "VAC-001", "VAC-002", "PM-VAC"}},
-		{"rotor_wear", "Rotor and booster wear", []string{"VAC-011", "VAC-003", "PM-VAC"}},
-		{"purge_block", "N2 purge line blockage", []string{"VAC-012", "VAC-004"}},
+		fault("deposition", "Process by-product deposition", "VAC-010", "VAC-001", "VAC-002", "PM-VAC"),
+		fault("rotor_wear", "Rotor and booster wear", "VAC-011", "VAC-003", "PM-VAC"),
+		fault("purge_block", "N2 purge line blockage", "VAC-012", "VAC-004"),
 	}
 	m.Trips = []TripSpec{{"VAC-001", "dp_current", 15.5, "Dry pump tripped on motor overcurrent"}}
 	m.PMCode, m.PMRepeat, m.PMHours = "PM-VAC", 4, 6
@@ -716,10 +850,11 @@ func dryPumpModel(name, desc string, overrides map[string]CondSpec) *ModelSpec {
 	return &m
 }
 
-// models returns every model; base models come before their extensions.
-// chwSystemModel is the BMS view of the chilled water plant as a whole: the
-// points a plant controller exposes on top of the individual chillers and
-// pumps (headers, riser differential pressure, bypass, plant efficiency).
+// chwSystemModel is the BMS plant controller of the chiller plant as a whole:
+// the points it exposes on top of the individual chillers, pumps and towers
+// (CHW headers, riser differential pressure, bypass, condenser water loop,
+// 3-way tower bypass valve, plant efficiency) and its supervisory set points
+// (CHW supply reset, chiller staging, tower approach, riser DP).
 func chwSystemModel() *ModelSpec {
 	p := append(statusParams(),
 		numP("chws_temp", "CHW Supply Header Temp", "°C", 2).W(">", 7.5).C(">", 8.5),
@@ -734,10 +869,29 @@ func chwSystemModel() *ModelSpec {
 		numP("plant_kw", "Plant Power", "kW", 0),
 		numP("plant_eff", "Plant Efficiency", "kW/RT", 3).W(">", 0.85),
 		numP("chillers_running", "Chillers Running", "", 0),
+		numP("oa_temp", "Outdoor Air Temp", "°C", 1),
+		numP("wet_bulb", "Outdoor Wet Bulb Temp", "°C", 2),
+		numP("chws_reset_mode", "CHW Set Point Mode", "", 0).Modes("chws_temp", "Reset", "Manual"),
+		numP("chws_sp", "CHW Supply Set Point", "°C", 1).SP(5.5, 8.0, 0.1, "chws_reset_mode", "chws_temp"),
+		numP("staging_mode", "Chiller Staging Mode", "", 0).Modes("chillers_running", "Load", "Manual"),
+		numP("chillers_sp", "Duty Chillers Set Point", "", 0).SP(1, 3, 1, "staging_mode", "chillers_running").Def(2),
+		numP("approach_sp", "Tower Approach Set Point", "K", 1).SP(2.0, 8.0, 0.1, "", "cwst_sp").Def(3.5),
+		numP("cw_min_temp", "Min Condenser Water Temp", "°C", 1).SP(15.0, 28.0, 0.5, "", "cw_supply_temp").Def(20.0),
+		numP("cwst_sp", "Tower Leaving Water Set Point", "°C", 2),
+		numP("tower_supply_temp", "Tower Leaving Water Header Temp", "°C", 2),
+		numP("cw_supply_temp", "CW Supply Temp", "°C", 2),
+		numP("cw_return_temp", "CW Return Temp", "°C", 2),
+		numP("cw_flow", "Condenser Water Flow", "m³/h", 0),
+		numP("fan_speed_cmd", "Tower Fan Speed Command", "%", 1),
+		numP("twv_min_pos", "3-Way Valve Min Position", "%", 0).SP(0, 50, 1, "", "twv_pos").Def(0),
+		numP("twv_cmd", "3-Way Valve Command", "%", 1),
+		numP("twv_pos", "3-Way Valve Position", "%", 1),
+		numP("riser_dp_sp", "Riser DP Set Point", "kPa", 0).SP(80, 160, 1, "", "riser_dp").Def(120),
+		numP("chwp_speed_cmd", "CHW Pump Speed Command", "Hz", 1),
 	)
 	return &ModelSpec{
 		Key: "chws", Name: "CUB Chilled Water Plant Controller", Type: "Chilled Water System", Brand: "Daikin", Series: "Plant Controls",
-		Description: "Variable-primary chilled water plant (BMS plant level): supply / return headers, riser differential pressure, minimum-flow bypass and plant kW/RT",
+		Description: "Chiller plant controller (CHW and CW loops)",
 		Params:      p,
 		Alarms: []AlarmSpec{
 			{"CHS-001", "CHW supply header above 8.5 °C - fab cooling coils losing capacity", true, "THR-01", gt("chws_temp", 8.5, true)},
@@ -745,12 +899,25 @@ func chwSystemModel() *ModelSpec {
 			{"CHS-003", "Header delta T below 3.0 K - low delta T syndrome, excess pumping", false, "THR-02", lt("delta_t", 3.0, true)},
 			{"CHS-004", "Plant efficiency worse than 0.85 kW/RT", false, "THR-02", gt("plant_eff", 0.85, true)},
 		},
+		Relations: []RelationSpec{fddRelation("CHS-005"), fddRelation("CHS-006"), fddRelation("CHS-007"), fddRelation("CHS-008")},
+		Faults: []FaultSpec{
+			lbnl("riser_dp_bias", "Riser differential pressure sensor bias (fraction of reading)", "fraction", []float64{-0.20, -0.10, 0.10, 0.20}, "CHS-005"),
+			lbnl("twv_leak", "Condenser 3-way valve leakage (bypassed fraction)", "fraction", []float64{0.25, 0.50, 0.75}, "CHS-006"),
+			lbnl("twv_stuck", "Condenser 3-way valve stuck (position fraction)", "fraction", []float64{0.50, 0.75}, "CHS-007"),
+			lbnl("cw_pi_tuning", "Tower fan speed PI loop detuned", "", []float64{1}, "CHS-008"),
+		},
 		Mapping: map[string][]string{
 			"CHS-001": {"chws_temp", "chillers_running", "cooling_load"}, "CHS-002": {"riser_dp", "plant_flow", "fab_flow"},
 			"CHS-003": {"delta_t", "bypass_valve", "bypass_flow"}, "CHS-004": {"plant_eff", "plant_kw", "cooling_load"},
+			"CHS-005": {"riser_dp", "riser_dp_sp", "chwp_speed_cmd", "plant_flow"},
+			"CHS-006": {"twv_pos", "twv_min_pos", "cw_supply_temp", "tower_supply_temp", "cw_return_temp"},
+			"CHS-007": {"twv_pos", "twv_cmd", "cw_supply_temp"},
+			"CHS-008": {"fan_speed_cmd", "tower_supply_temp", "cwst_sp"},
 		},
 	}
 }
+
+// models returns every model; base models come before their extensions.
 
 func models() []*ModelSpec {
 	return []*ModelSpec{
@@ -925,6 +1092,11 @@ var userGroups = func() []GroupSpec {
 		"locationoverview":        {"update"},
 		"notificationmanager":     {"read", "update"},
 		"digitaltwin":             {"read", "update"},
+		// AI assistant, AI insights (apply / dismiss recommendations, rules,
+		// documents) and digital twin simulations (run and approve)
+		"aiassistant": {"read"},
+		"aiinsights":  {"read", "update"},
+		"simulation":  {"read", "create"},
 	} {
 		mgmt[g] = append(mgmt[g], extra...)
 	}
@@ -932,10 +1104,17 @@ var userGroups = func() []GroupSpec {
 	tech["maintenanceorder"] = append(tech["maintenanceorder"], "create", "update", "report")
 	tech["earlywarningdiagnostics"] = append(tech["earlywarningdiagnostics"], "update")
 	tech["digitaltwin"] = []string{"read"}
+	tech["aiassistant"] = []string{"read"}
+	tech["aiinsights"] = []string{"read"}
+	tech["simulation"] = []string{"read"}
 	ops := readAll("locationoverview", "equipmentoverview", "alarmsreport", "maintenanceorder", "earlywarningdiagnostics", "earlywarningdashboard", "maintenanceinstruction")
 	ops["maintenanceorder"] = append(ops["maintenanceorder"], "create")
-	// control room operators run the plant: they may write set points and modes
+	// control room operators run the plant: they may write set points and
+	// modes, and run (and approve) digital twin simulations
 	ops["digitaltwin"] = []string{"read", "update"}
+	ops["aiassistant"] = []string{"read"}
+	ops["aiinsights"] = []string{"read"}
+	ops["simulation"] = []string{"read", "create"}
 	all := []string{"FAB1 Wafer Fab", "CUB Central Utility Building"}
 	return []GroupSpec{
 		{"facility_management", "Facility Management", "Facility managers, supervisors and reliability engineers", all, mgmt},
