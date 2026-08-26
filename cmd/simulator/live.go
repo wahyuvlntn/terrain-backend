@@ -82,7 +82,9 @@ func restoreState(p *Plant, st SimState) {
 }
 
 // Command is an operator write received on a gateway's command topic
-// ("<gateway identity>/cmd/<equipment alias>").
+// ("<gateway identity>/cmd/<equipment alias>"): a set point or mode
+// (parameter, value) or an on-demand fault injection (fault, value, action
+// inject | clear).
 type Command struct {
 	Gateway   string  `json:"-"`
 	Device    string  `json:"-"`
@@ -90,9 +92,17 @@ type Command struct {
 	Parameter string  `json:"parameter"`
 	Value     float64 `json:"value"`
 	User      string  `json:"user"`
+	Fault     string  `json:"fault"`
+	Action    string  `json:"action"`
 	// ExpiresAt (ms): the backend stops waiting for the read-back then; a
 	// later command is dropped so it can't change the plant after a TIMEOUT.
 	ExpiresAt int64 `json:"expires_at"`
+}
+
+// snapshotReq asks the simulation loop for a deep copy of the live plant.
+type snapshotReq struct {
+	seed  uint64
+	reply chan *Plant
 }
 
 // LiveOptions configure the live simulation.
@@ -122,13 +132,14 @@ type Live struct {
 	nextO   time.Time
 	lastChk time.Time
 	seen    map[string]bool
-	trips   chan *Asset   // tripped assets for the operator bot
-	cmds    chan Command // operator writes, applied on the simulation loop
+	trips   chan *Asset      // tripped assets for the operator bot
+	cmds    chan Command     // operator writes, applied on the simulation loop
+	snaps   chan snapshotReq // plant snapshots for simulation jobs
 }
 
 func newLive(ctx context.Context, db *pgxpool.Pool, plant *Plant, opts LiveOptions, seed uint64) *Live {
 	l := &Live{ctx: ctx, db: db, plant: plant, opts: opts, rng: rand.New(rand.NewPCG(seed, seed^42)), clients: map[string]paho.Client{},
-		trips: make(chan *Asset, 16), cmds: make(chan Command, 64), seen: map[string]bool{}}
+		trips: make(chan *Asset, 16), cmds: make(chan Command, 64), snaps: make(chan snapshotReq), seen: map[string]bool{}}
 	now := time.Now()
 	l.nextF = now.Add(l.expo(opts.FaultEvery) / 2)
 	l.nextT = now.Add(l.expo(opts.TripEvery))
@@ -191,8 +202,9 @@ func (l *Live) onCommand(gateway string) paho.MessageHandler {
 	}
 }
 
-// applyCommand applies an operator write to the plant. The device ignores it
-// while its communication is lost (the backend then times the request out).
+// applyCommand applies an operator write or fault injection to the plant. The
+// device ignores it while its communication is lost (the backend then times
+// the request out).
 func (l *Live) applyCommand(cmd Command) bool {
 	a := l.plant.ByAlias[cmd.Device]
 	switch {
@@ -200,11 +212,13 @@ func (l *Live) applyCommand(cmd Command) bool {
 		slog.Warn("command for unknown equipment", "gateway", cmd.Gateway, "equipment", cmd.Device)
 		return false
 	case a.Offline:
-		slog.Info("command ignored: no communication", "equipment", cmd.Device, "parameter", cmd.Parameter)
+		slog.Info("command ignored: no communication", "equipment", cmd.Device, "parameter", cmd.Parameter, "fault", cmd.Fault)
 		return false
 	case cmd.ExpiresAt > 0 && time.Now().UnixMilli() > cmd.ExpiresAt:
-		slog.Warn("command expired, dropped", "equipment", cmd.Device, "parameter", cmd.Parameter, "request", cmd.RequestID)
+		slog.Warn("command expired, dropped", "equipment", cmd.Device, "parameter", cmd.Parameter, "fault", cmd.Fault, "request", cmd.RequestID)
 		return false
+	case cmd.Fault != "":
+		return l.applyFault(a, cmd)
 	}
 	if err := a.applyControl(cmd.Parameter, cmd.Value); err != nil {
 		slog.Warn("command rejected", "equipment", cmd.Device, "parameter", cmd.Parameter, "value", cmd.Value, "err", err,
@@ -214,6 +228,49 @@ func (l *Live) applyCommand(cmd Command) bool {
 	slog.Info("command applied", "equipment", cmd.Device, "parameter", cmd.Parameter, "value", cmd.Value,
 		"request", cmd.RequestID, "user", cmd.User)
 	return true
+}
+
+// applyFault injects or clears a fault on demand ("fault" commands of the
+// digital twin's fault injection).
+func (l *Live) applyFault(a *Asset, cmd Command) bool {
+	switch cmd.Action {
+	case "inject":
+		f, err := a.injectFault(cmd.Fault, cmd.Value, time.Now(), 1.25/(l.opts.RampMax*60))
+		if err != nil {
+			slog.Warn("fault injection rejected", "equipment", cmd.Device, "fault", cmd.Fault, "value", cmd.Value, "err", err,
+				"request", cmd.RequestID, "user", cmd.User)
+			return false
+		}
+		slog.Info("fault injected", "equipment", cmd.Device, "fault", f.Kind, "value", cmd.Value, "request", cmd.RequestID, "user", cmd.User)
+		return true
+	case "clear":
+		if a.Faults[cmd.Fault] == nil {
+			slog.Info("fault clear ignored: not active", "equipment", cmd.Device, "fault", cmd.Fault, "request", cmd.RequestID)
+			return false
+		}
+		delete(a.Faults, cmd.Fault)
+		slog.Info("fault cleared", "equipment", cmd.Device, "fault", cmd.Fault, "request", cmd.RequestID, "user", cmd.User)
+		return true
+	}
+	slog.Warn("fault command rejected: unknown action", "equipment", cmd.Device, "fault", cmd.Fault, "action", cmd.Action, "request", cmd.RequestID)
+	return false
+}
+
+// Snapshot returns a deep copy of the live plant (Plant.Clone with seed),
+// taken on the simulation loop so it is consistent.
+func (l *Live) Snapshot(ctx context.Context, seed uint64) (*Plant, error) {
+	req := snapshotReq{seed: seed, reply: make(chan *Plant, 1)}
+	select {
+	case l.snaps <- req:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case p := <-req.reply:
+		return p, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (l *Live) ensureClients() {
@@ -268,6 +325,8 @@ func (l *Live) Run() error {
 			l.scenario(now, dt)
 			values := l.plant.Step(now.UTC(), dt)
 			l.publish(values)
+		case req := <-l.snaps:
+			req.reply <- l.plant.Clone(req.seed)
 		case cmd := <-l.cmds:
 			if !l.applyCommand(cmd) {
 				continue
@@ -321,42 +380,31 @@ func (l *Live) activeFaults() int {
 
 // scenario evolves faults, trips and communication losses.
 func (l *Live) scenario(now time.Time, dt float64) {
-	for _, a := range l.plant.Assets {
-		for _, f := range a.Faults {
-			f.Sev = math.Min(maxSeverity, f.Sev+f.Rate*dt)
+	ev := l.plant.evolve(now, dt, func(*Asset) time.Duration { return time.Duration(l.uniform(25, 45) * float64(time.Minute)) })
+	for _, a := range ev.Restored {
+		slog.Info("communication restored", "equipment", a.Spec.Alias)
+	}
+	for _, a := range ev.Tripped {
+		slog.Info("equipment tripped", "equipment", a.Spec.Alias, "reason", a.TripSpec.Reason)
+		select {
+		case l.trips <- a:
+		default:
 		}
-		if a.Kind == "mau" {
-			a.FilterDays += dt / 86400
-		}
-		if a.Offline && now.After(a.OffUntil) {
-			a.Offline = false
-			slog.Info("communication restored", "equipment", a.Spec.Alias)
-		}
-		if !a.SpikeUntil.IsZero() && now.After(a.SpikeUntil) {
-			a.SpikeUntil = time.Time{}
-			a.Trip = true
-			a.TripUntil = now.Add(time.Duration(l.uniform(25, 45) * float64(time.Minute)))
-			slog.Info("equipment tripped", "equipment", a.Spec.Alias, "reason", a.TripSpec.Reason)
-			select {
-			case l.trips <- a:
-			default:
-			}
-		}
-		if a.Trip && !a.TripUntil.IsZero() && now.After(a.TripUntil) {
-			a.Trip = false
-			a.TripUntil = time.Time{}
-			slog.Info("trip reset by operator", "equipment", a.Spec.Alias)
-		}
+	}
+	for _, a := range ev.TripReset {
+		slog.Info("trip reset by operator", "equipment", a.Spec.Alias)
 	}
 	if now.After(l.nextF) {
 		l.nextF = now.Add(l.expo(l.opts.FaultEvery))
 		if l.activeFaults() < l.opts.MaxFaults {
-			l.injectFault(now)
+			if a, f, ramp := l.plant.injectRandomFault(l.rng, now, l.opts.RampMin, l.opts.RampMax); a != nil {
+				slog.Info("degradation started", "equipment", a.Spec.Alias, "fault", f.Label, "ramp_minutes", int(ramp/60))
+			}
 		}
 	}
 	if now.After(l.nextT) {
 		l.nextT = now.Add(l.expo(l.opts.TripEvery))
-		l.injectTrip(now)
+		l.plant.injectRandomTrip(l.rng, now)
 	}
 	if now.After(l.nextO) {
 		l.nextO = now.Add(l.expo(l.opts.OfflineEvry))
@@ -368,50 +416,25 @@ func (l *Live) scenario(now time.Time, dt float64) {
 
 func (l *Live) uniform(a, b float64) float64 { return a + l.rng.Float64()*(b-a) }
 
-func (l *Live) injectFault(now time.Time) {
-	for tries := 0; tries < 20; tries++ {
-		a := l.plant.Assets[l.rng.IntN(len(l.plant.Assets))]
-		if !a.Running() || len(a.Model.Faults) == 0 {
-			continue
-		}
-		f := a.Model.Faults[l.rng.IntN(len(a.Model.Faults))]
-		if a.Faults[f.Kind] != nil {
-			continue
-		}
-		ramp := l.uniform(l.opts.RampMin, l.opts.RampMax) * 60
-		a.Faults[f.Kind] = &Fault{Kind: f.Kind, Rate: 1.25 / ramp, Start: now}
-		slog.Info("degradation started", "equipment", a.Spec.Alias, "fault", f.Label, "ramp_minutes", int(ramp/60))
-		return
-	}
-}
-
-func (l *Live) injectTrip(now time.Time) {
-	for tries := 0; tries < 20; tries++ {
-		a := l.plant.Assets[l.rng.IntN(len(l.plant.Assets))]
-		if !a.Running() || a.Trip || len(a.Model.Trips) == 0 {
-			continue
-		}
-		ts := a.Model.Trips[0]
-		a.TripSpec = &ts
-		a.SpikeUntil = now.Add(45 * time.Second)
-		return
-	}
-}
-
 // syncForced stops equipment that maintenance put in a forced status.
 func (l *Live) syncForced() {
-	rows, err := l.db.Query(l.ctx, `SELECT alias, forced_status_id IS NOT NULL FROM asset.equipment`)
+	rows, err := l.db.Query(l.ctx, `SELECT alias, COALESCE(forced_status_id, 0) FROM asset.equipment`)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var alias string
-		var forced bool
-		if rows.Scan(&alias, &forced) != nil {
+		var status int
+		if rows.Scan(&alias, &status) != nil {
 			continue
 		}
-		if a := l.plant.ByAlias[alias]; a != nil && a.Maint != forced {
+		a := l.plant.ByAlias[alias]
+		if a == nil {
+			continue
+		}
+		a.Forced = status
+		if forced := status != 0; a.Maint != forced {
 			a.Maint = forced
 			if forced {
 				slog.Info("equipment stopped for maintenance", "equipment", alias)
