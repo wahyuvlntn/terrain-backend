@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"afdd/internal/engine"
@@ -249,23 +251,58 @@ type History struct {
 	values   [][]any
 	nValues  int
 	episodes []*episode
+	fdd      []*fddEpisode // LBNL fault episodes and their FDD alarm
+	ctls     []*ctlChange  // operator set point changes (sorted by time)
+	ctlR     [][]any       // asset.control_requests rows
+	// copyValues stores parameter value rows (COPY into ts.parameter_values;
+	// tests count them in memory).
+	copyValues func(rows [][]any) (int64, error)
 }
 
 type episode struct {
 	At    time.Time
 	Asset *Asset
-	Kind  string // fault | trip | offline | minor | reject
+	Kind  string // fault | trip | offline | minor | reject | lbnl
 	Fault string
 	Rate  float64
+	Value float64 // LBNL fault intensity
 	Dur   time.Duration
 	Code  string
 }
 
+// fddEpisode is a labelled LBNL fault: the analytics FDD rule detects it 1-4
+// h after onset and the engine raises its code as an alarm (source key
+// ext:fdd:<code>) until the corrective order repairs the fault.
+type fddEpisode struct {
+	Asset   *Asset
+	Kind    string
+	Code    string
+	Onset   time.Time
+	Detect  time.Time
+	ClearBy time.Time // planned end of the episode (the order is timed for it)
+	start   time.Time // alarm start (zero until detected)
+	done    bool
+}
+
+// ctlChange is an operator set point or mode change of the history.
+type ctlChange struct {
+	At    time.Time
+	Asset *Asset
+	Param string
+	Value float64
+	User  string
+}
+
 func newHistory(ctx context.Context, db *pgxpool.Pool, plant *Plant, ids *IDs, days int, seed uint64) *History {
 	end := time.Now().UTC().Truncate(time.Minute)
-	return &History{ctx: ctx, db: db, plant: plant, ids: ids, loc: plant.loc, rng: rand.New(rand.NewPCG(seed, seed+7)),
+	h := &History{ctx: ctx, db: db, plant: plant, ids: ids, loc: plant.loc, rng: rand.New(rand.NewPCG(seed, seed+7)),
 		start: end.Add(-time.Duration(days) * 24 * time.Hour), end: end, step: time.Minute,
 		tracks: map[*Asset]*track{}, openEW: map[string]*hOrder{}}
+	h.copyValues = func(rows [][]any) (int64, error) {
+		return h.db.CopyFrom(h.ctx, pgx.Identifier{"ts", "parameter_values"}, []string{"equipment_parameter_id", "ts", "value", "value_text"},
+			pgx.CopyFromRows(rows))
+	}
+	return h
 }
 
 func (h *History) uniform(a, b float64) float64 { return a + h.rng.Float64()*(b-a) }
@@ -324,23 +361,28 @@ func (h *History) plan() {
 	at := func(min time.Duration) time.Time {
 		return h.start.Add(min + time.Duration(h.rng.Float64()*float64(span-min-time.Hour)))
 	}
-	// Degradations: about one per asset every 45 days.
+	// Degradations: about one per asset every 45 days (never the Manual
+	// LBNL faults, planned below).
 	for _, a := range h.plant.Assets {
+		cands := a.Model.randomFaults()
 		n := poisson(h.rng, days/45)
-		for i := 0; i < n && len(a.Model.Faults) > 0; i++ {
-			f := a.Model.Faults[h.rng.IntN(len(a.Model.Faults))]
+		for i := 0; i < n && len(cands) > 0; i++ {
+			f := cands[h.rng.IntN(len(cands))]
 			ramp := h.uniform(2, 9) * 86400
 			h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "fault", Fault: f.Kind, Rate: 1.25 / ramp})
 		}
 	}
 	// Make sure a few degradations are developing right now.
 	for i := 0; i < 4; i++ {
-		a := h.plant.pick(h.rng, func(a *Asset) bool { return len(a.Model.Faults) > 0 })
-		f := a.Model.Faults[h.rng.IntN(len(a.Model.Faults))]
+		a := h.plant.pick(h.rng, func(a *Asset) bool { return len(a.Model.randomFaults()) > 0 })
+		cands := a.Model.randomFaults()
+		f := cands[h.rng.IntN(len(cands))]
 		ramp := h.uniform(3, 7) * 86400
 		h.episodes = append(h.episodes, &episode{At: h.end.Add(-time.Duration(h.uniform(1, 2.5) * float64(24*time.Hour))), Asset: a,
 			Kind: "fault", Fault: f.Kind, Rate: 1.25 / ramp})
 	}
+	h.planLBNL()
+	h.planControls()
 	for i := 0; i < int(days/6); i++ {
 		a := h.plant.Assets[h.rng.IntN(len(h.plant.Assets))]
 		h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "trip"})
@@ -365,6 +407,191 @@ func (h *History) plan() {
 		h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "reject", Code: "GEN-002"})
 	}
 	sort.Slice(h.episodes, func(i, j int) bool { return h.episodes[i].At.Before(h.episodes[j].At) })
+}
+
+// planLBNL plans 1-2 labelled episodes of every LBNL fault kind (DESIGN 2.6)
+// on units of its model: 6 h to 3 days long, never overlapping another LBNL
+// episode of the same unit, and over (repaired by the FDD order) before the
+// end of the window.
+func (h *History) planLBNL() {
+	span := h.end.Sub(h.start)
+	if span < 2*24*time.Hour {
+		return
+	}
+	// durations and the room kept for the order workflow shrink with a short window
+	maxDur := min(72*time.Hour, span/12)
+	before, after := min(12*time.Hour, span/48), min(36*time.Hour, span/16)
+	type kind struct {
+		fs    FaultSpec
+		units []*Asset
+	}
+	var kinds []kind
+	for _, m := range models() {
+		var units []*Asset
+		for _, a := range h.plant.Assets {
+			if a.Model.Name == m.Name {
+				units = append(units, a)
+			}
+		}
+		for _, fs := range m.Faults {
+			if len(units) > 0 && fs.Manual && len(fs.Intensities) > 0 && len(fs.Codes) > 0 {
+				kinds = append(kinds, kind{fs, units})
+			}
+		}
+	}
+	busy := map[*Asset][][2]time.Time{}
+	place := func(k kind) {
+		for tries := 0; tries < 100; tries++ {
+			a := k.units[h.rng.IntN(len(k.units))]
+			dur := time.Duration(h.uniform(6*3600, math.Max(maxDur.Seconds(), 6*3600)) * float64(time.Second))
+			lo, hi := h.start.Add(span/20), h.end.Add(-dur-span/6)
+			if !hi.After(lo) {
+				return
+			}
+			at := lo.Add(time.Duration(h.rng.Float64() * float64(hi.Sub(lo)))).Truncate(time.Minute)
+			win := [2]time.Time{at.Add(-before), at.Add(dur + after)}
+			overlap := false
+			for _, b := range busy[a] {
+				overlap = overlap || (win[0].Before(b[1]) && b[0].Before(win[1]))
+			}
+			if overlap {
+				continue
+			}
+			busy[a] = append(busy[a], win)
+			h.episodes = append(h.episodes, &episode{At: at, Asset: a, Kind: "lbnl", Fault: k.fs.Kind,
+				Value: k.fs.Intensities[h.rng.IntN(len(k.fs.Intensities))], Dur: dur, Code: k.fs.Codes[0]})
+			return
+		}
+	}
+	// one episode of every kind first, then a second one for about half
+	for _, k := range kinds {
+		place(k)
+	}
+	for _, k := range kinds {
+		if h.rng.IntN(2) == 0 {
+			place(k)
+		}
+	}
+}
+
+// planControls plans occasional operator set point changes on the plant
+// controller (about two a week): a trial of a new tower approach or riser DP
+// set point, a manual CHW supply set point or a manual third chiller, each
+// set back after hours to days. They are applied at their time and stored as
+// asset.control_requests (the historical parameter settings).
+func (h *History) planControls() {
+	sys := h.plant.sys
+	if sys == nil {
+		return
+	}
+	users := []string{"kevin_ong", "sarah_lim", "jason_teo", "siti_rahmah"}
+	add := func(at time.Time, param string, v float64, user string) {
+		h.ctls = append(h.ctls, &ctlChange{At: at.Truncate(time.Second), Asset: sys, Param: param, Value: v, User: user})
+	}
+	day := 24 * time.Hour
+	pickF := func(vs ...float64) float64 { return vs[h.rng.IntN(len(vs))] }
+	t := h.start.Add(time.Duration(h.uniform(1, 3) * float64(day)))
+	for {
+		user := users[h.rng.IntN(len(users))]
+		at := h.workTime(t)
+		var back time.Time
+		switch h.rng.IntN(4) {
+		case 0:
+			back = at.Add(time.Duration(h.uniform(1, 4) * float64(day)))
+			if back.After(h.end.Add(-day)) {
+				return
+			}
+			add(at, "approach_sp", pickF(3.0, 3.2, 4.0, 4.5), user)
+			add(h.workTime(back), "approach_sp", defApproachSP, user)
+		case 1:
+			back = at.Add(time.Duration(h.uniform(1, 3) * float64(day)))
+			if back.After(h.end.Add(-day)) {
+				return
+			}
+			add(at, "riser_dp_sp", pickF(105, 110, 130, 135), user)
+			add(h.workTime(back), "riser_dp_sp", defRiserDPSP, user)
+		case 2:
+			back = at.Add(time.Duration(h.uniform(6, 48) * float64(time.Hour)))
+			if back.After(h.end.Add(-day)) {
+				return
+			}
+			add(at, "chws_reset_mode", 1, user)
+			add(at.Add(40*time.Second), "chws_sp", pickF(6.8, 7.2, 7.5), user)
+			add(back, "chws_reset_mode", 0, user)
+		default:
+			back = at.Add(time.Duration(h.uniform(4, 12) * float64(time.Hour)))
+			if back.After(h.end.Add(-day)) {
+				return
+			}
+			add(at, "staging_mode", 1, user)
+			add(at.Add(30*time.Second), "chillers_sp", 3, user)
+			add(back, "staging_mode", 0, user)
+		}
+		t = back.Add(time.Duration(h.uniform(4, 9) * float64(day)))
+	}
+}
+
+// applyControl applies a planned operator change and records its control
+// request (APPLIED, confirmed by the plant about 0.13 s later).
+func (h *History) applyControl(c *ctlChange) {
+	a := c.Asset
+	old := a.ctl(c.Param, 0)
+	if v, ok := a.last[c.Param]; ok {
+		old = v
+	}
+	if err := a.applyControl(c.Param, c.Value); err != nil {
+		slog.Debug("history control change skipped", "equipment", a.Spec.Alias, "parameter", c.Param, "err", err)
+		return
+	}
+	ep := h.ids.EP[a.Spec.Alias][c.Param]
+	if ep == 0 {
+		return
+	}
+	done := c.At.Add(time.Duration(110+h.rng.IntN(60)) * time.Millisecond)
+	h.ctlR = append(h.ctlR, []any{h.ids.Equip[a.Spec.Alias], ep, h.uid(c.User), old, c.Value, "APPLIED", nil, c.At, done})
+}
+
+// fddActive returns the FDD alarm codes active on an asset at the moment.
+func (h *History) fddActive(a *Asset) []string {
+	var out []string
+	for _, f := range h.fdd {
+		if f.Asset == a && !f.start.IsZero() && !f.done {
+			out = append(out, f.Code)
+		}
+	}
+	return out
+}
+
+// trackFDD detects the LBNL episodes whose detection time came and closes the
+// FDD alarms of repaired faults.
+func (h *History) trackFDD(t time.Time, notifyOn bool) {
+	for _, f := range h.fdd {
+		if f.done {
+			continue
+		}
+		a := f.Asset
+		if a.Faults[f.Kind] == nil {
+			// repaired (or never developed): the analytics clears the fault
+			if !f.start.IsZero() {
+				cid := h.ids.Code[f.Code]
+				h.eventR = append(h.eventR, []any{h.ids.Equip[a.Spec.Alias], "ALARM", "ext:fdd:" + f.Code, nil, nil, &cid, f.Code, "WARNING",
+					fddMessage(f.Code), f.start, t})
+			}
+			f.done = true
+			continue
+		}
+		if f.start.IsZero() && !t.Before(f.Detect) && !a.Offline {
+			f.start = t
+			if notifyOn {
+				h.notify(t, a, "ALARM_WARNING", notify.AlarmMessage("WARNING", f.Code, a.Spec.Name), nil)
+			}
+		}
+	}
+}
+
+// fddMessage is the alarm message of an FDD rule code.
+func fddMessage(code string) string {
+	return "FDD rule " + code + ": " + codeName(code) + " detected by the analytics service"
 }
 
 func poisson(r *rand.Rand, lambda float64) int {
@@ -658,7 +885,8 @@ func (h *History) Generate() error {
 	for _, a := range h.plant.Assets {
 		h.tracks[a] = &track{events: map[string]*openEv{}, pending: map[string]int{}}
 	}
-	ep := 0
+	ep, cc := 0, 0
+	sort.SliceStable(h.ctls, func(i, j int) bool { return h.ctls[i].At.Before(h.ctls[j].At) })
 	dt := h.step.Seconds()
 	recent := h.end.Add(-7 * 24 * time.Hour)
 	notifyFrom := h.end.Add(-48 * time.Hour)
@@ -667,6 +895,10 @@ func (h *History) Generate() error {
 		for ep < len(h.episodes) && !h.episodes[ep].At.After(t) {
 			h.startEpisode(h.episodes[ep], t)
 			ep++
+		}
+		for cc < len(h.ctls) && !h.ctls[cc].At.After(t) {
+			h.applyControl(h.ctls[cc])
+			cc++
 		}
 		for _, a := range h.plant.Assets {
 			for _, f := range a.Faults {
@@ -689,6 +921,7 @@ func (h *History) Generate() error {
 			}
 			h.advance(o, t)
 		}
+		h.trackFDD(t, !t.Before(notifyFrom))
 		values := h.plant.Step(t, dt)
 		logNow := lastLog.IsZero() || (t.Before(recent) && t.Sub(lastLog) >= 15*time.Minute) || (!t.Before(recent) && t.Sub(lastLog) >= 5*time.Minute)
 		if logNow {
@@ -698,7 +931,13 @@ func (h *History) Generate() error {
 			v := values[a]
 			tr := h.tracks[a]
 			ev := h.plant.evaluate(a, v, a.Offline, tr.forced)
-			h.trackStatus(a, tr, ev, t, !t.Before(notifyFrom))
+			// an active FDD alarm (engine external alarm) sets the condition
+			// and drives its issue relation like the live engine
+			evD := ev
+			if codes := h.fddActive(a); len(codes) > 0 && !a.Offline {
+				evD = withAlarms(ev, codes)
+			}
+			h.trackStatus(a, tr, evD, t, !t.Before(notifyFrom))
 			h.trackEvents(a, tr, ev, t, !t.Before(notifyFrom))
 			if !a.Offline {
 				if logNow {
@@ -707,8 +946,8 @@ func (h *History) Generate() error {
 				if !a.SpikeUntil.IsZero() {
 					continue
 				}
-				for _, d := range h.plant.diagnose(a, ev) {
-					h.earlyWarning(a, d, ev, t)
+				for _, d := range h.plant.diagnose(a, evD) {
+					h.earlyWarning(a, d, evD, t)
 				}
 			}
 		}
@@ -753,7 +992,55 @@ func (h *History) startEpisode(e *episode, t time.Time) {
 			Reject: "Inspected on site - noise is within the normal operating range, no fault found."}
 		h.newCorrective(a, t, o, false)
 		o.rejectAt = h.workTime(t.Add(h.dur(60, 240)))
+	case "lbnl":
+		// The FDD rules need a running unit, and a unit carries one labelled
+		// episode at a time: a running sibling free of LBNL faults takes the
+		// episode of a stopped chiller or tower, or of a unit whose earlier
+		// episode is still being repaired (else the episode is dropped).
+		if (!a.Running() && (a.Kind == "chiller" || a.Kind == "ct")) || hasManualFault(a) {
+			var alt *Asset
+			for _, b := range h.plant.Assets {
+				if b.Model == a.Model && b.Running() && !hasManualFault(b) {
+					alt = b
+					break
+				}
+			}
+			if alt == nil {
+				return
+			}
+			a = alt
+		}
+		a.Faults[e.Fault] = &Fault{Kind: e.Fault, Value: e.Value, Sev: 1, Start: t}
+		h.fdd = append(h.fdd, &fddEpisode{Asset: a, Kind: e.Fault, Code: e.Code, Onset: t,
+			Detect: t.Add(h.dur(60, 240)), ClearBy: t.Add(e.Dur)})
 	}
+}
+
+// hasManualFault reports whether an asset has an active LBNL fault.
+func hasManualFault(a *Asset) bool {
+	for k := range a.Faults {
+		if fs := a.Model.faultSpec(k); fs != nil && fs.Manual {
+			return true
+		}
+	}
+	return false
+}
+
+// withAlarms returns an evaluation with the FDD alarm codes added (the
+// engine appends active analytics faults to its alarms).
+func withAlarms(ev Evaluation, codes []string) Evaluation {
+	out := ev
+	out.Alarms = make(map[string]hit, len(ev.Alarms)+len(codes))
+	for k, v := range ev.Alarms {
+		out.Alarms[k] = v
+	}
+	for _, c := range codes {
+		out.Alarms[c] = hit{Severity: "WARNING", Message: fddMessage(c)}
+	}
+	if out.Cond == engine.CondNormal {
+		out.Cond = engine.CondWarning
+	}
+	return out
 }
 
 func (h *History) earlyWarning(a *Asset, d Diagnosis, ev Evaluation, t time.Time) {
@@ -791,6 +1078,27 @@ func (h *History) earlyWarning(a *Asset, d Diagnosis, ev Evaluation, t time.Time
 	}
 	o.events = append(o.events, hEvent{At: t, Status: "CREATED", Details: map[string]any{"By": "System (early warning)", "Detected": o.Desc}})
 	h.newCorrective(a, t, o, false)
+	if isFDDCode(code) {
+		// FDD early warning: the fault is real (valid diagnosis, the repair
+		// clears it), the work is timed to end with the planned episode (no
+		// waiting for parts) and only the cleaning of a tower cell stops the
+		// unit
+		valid := true
+		o.validDiag = &valid
+		o.tripReset = 0
+		o.forced = 0
+		if code == "CT-014" {
+			o.forced = 3
+		}
+		for _, f := range h.fdd {
+			if f.Asset == a && f.Code == code && !f.done {
+				o.startAt = h.workTime(f.ClearBy.Add(-o.workDur))
+				if earliest := o.approveAt.Add(30 * time.Minute); o.startAt.Before(earliest) {
+					o.startAt = h.workTime(earliest)
+				}
+			}
+		}
+	}
 	h.openEW[key] = o
 }
 
@@ -913,8 +1221,7 @@ func (h *History) flushValues() error {
 	if len(h.values) == 0 {
 		return nil
 	}
-	n, err := h.db.CopyFrom(h.ctx, pgx.Identifier{"ts", "parameter_values"}, []string{"equipment_parameter_id", "ts", "value", "value_text"},
-		pgx.CopyFromRows(h.values))
+	n, err := h.copyValues(h.values)
 	if err != nil {
 		return fmt.Errorf("copy parameter values: %w", err)
 	}
@@ -932,6 +1239,13 @@ func (h *History) Store() error {
 		h.condR = append(h.condR, []any{id, tr.cond, tr.condStart, h.end})
 		for _, e := range tr.events {
 			h.eventR = append(h.eventR, []any{id, e.typ, e.key, e.modelAlarm, e.epid, e.code, e.name, e.sev, e.msg, e.start, h.end})
+		}
+	}
+	for _, f := range h.fdd {
+		if !f.start.IsZero() && !f.done {
+			cid := h.ids.Code[f.Code]
+			h.eventR = append(h.eventR, []any{h.ids.Equip[f.Asset.Spec.Alias], "ALARM", "ext:fdd:" + f.Code, nil, nil, &cid, f.Code, "WARNING",
+				fddMessage(f.Code), f.start, h.end})
 		}
 	}
 	return pgx.BeginFunc(h.ctx, h.db, func(tx pgx.Tx) error {
@@ -955,8 +1269,34 @@ func (h *History) Store() error {
 		if err := h.storeOrders(tx); err != nil {
 			return err
 		}
+		if len(h.ctlR) > 0 {
+			if _, err := tx.CopyFrom(h.ctx, pgx.Identifier{"asset", "control_requests"}, []string{"equipment_id", "equipment_parameter_id", "user_id",
+				"old_value", "value", "status", "reason", "requested_at", "completed_at"}, pgx.CopyFromRows(h.ctlR)); err != nil {
+				return fmt.Errorf("copy control_requests: %w", err)
+			}
+		}
 		return h.storeNotifications(tx)
 	})
+}
+
+// ensurePartitions creates the monthly partitions of ts.parameter_values for
+// the history window (migration 0006). Before that migration the function
+// does not exist and the plain table takes the rows, so its absence is only
+// a warning.
+func ensurePartitions(ctx context.Context, db *pgxpool.Pool, from, to time.Time) error {
+	var created int
+	err := db.QueryRow(ctx, `SELECT ts.ensure_parameter_values_partitions($1::date, $2::date)`,
+		from.UTC().Format("2006-01-02"), to.UTC().AddDate(0, 0, 1).Format("2006-01-02")).Scan(&created)
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "42883" { // undefined_function
+		slog.Warn("ts.ensure_parameter_values_partitions does not exist (parameter values not partitioned yet), continuing")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("ensure parameter value partitions: %w", err)
+	}
+	slog.Info("parameter value partitions ready", "from", from.UTC().Format(time.DateOnly), "to", to.UTC().Format(time.DateOnly), "created", created)
+	return nil
 }
 
 func (h *History) uid(username string) any {
@@ -1125,6 +1465,7 @@ func clearExisting(ctx context.Context, db *pgxpool.Pool, ids *IDs) error {
 		`DELETE FROM ts.alarm_events WHERE asset_id = ANY($1)`,
 		`DELETE FROM ts.running_hour_flags WHERE asset_id = ANY($1)`,
 		`DELETE FROM core.notifications WHERE asset_id = ANY($1)`,
+		`DELETE FROM asset.control_requests WHERE equipment_id = ANY($1)`,
 		`DELETE FROM dm.maintenance_schedules WHERE id IN (SELECT schedule_id FROM dm.maintenance_orders WHERE asset_id = ANY($1))`,
 		`DELETE FROM dm.maintenance_orders WHERE asset_id = ANY($1)`,
 		`UPDATE asset.equipment SET forced_status_id = NULL, forced_by_order_id = NULL WHERE id = ANY($1)`,
@@ -1148,6 +1489,9 @@ func runHistory(ctx context.Context, db *pgxpool.Pool, plant *Plant, days int, s
 		return nil, err
 	}
 	h := newHistory(ctx, db, plant, ids, days, seed)
+	if err := ensurePartitions(ctx, db, h.start, h.end); err != nil {
+		return nil, err
+	}
 	slog.Info("generating history", "from", h.start.Format(time.RFC3339), "to", h.end.Format(time.RFC3339))
 	started := time.Now()
 	if err := h.Generate(); err != nil {
@@ -1161,6 +1505,7 @@ func runHistory(ctx context.Context, db *pgxpool.Pool, plant *Plant, days int, s
 		stats[fmt.Sprintf("status_%d", stageStatus[o.stage])]++
 	}
 	slog.Info("history stored", "took", time.Since(started).Round(time.Second), "values", h.nValues, "status_intervals", len(h.statusR),
-		"alarm_events", len(h.eventR), "orders", len(h.orders), "notifications", len(h.notifR), "order_states", stats)
+		"alarm_events", len(h.eventR), "orders", len(h.orders), "notifications", len(h.notifR), "order_states", stats,
+		"lbnl_episodes", len(h.fdd), "control_requests", len(h.ctlR))
 	return h, nil
 }
