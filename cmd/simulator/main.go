@@ -23,6 +23,7 @@
 //	SIM_RAMP_MIN/MAX    minutes for a fault to develop   (20 / 60)
 //	SIM_WORKFORCE       simulate the maintenance team    (true)
 //	SIM_APPROVE_DELAY   idle time before the team acts   (15m)
+//	SIM_JOBS            run digital twin simulation jobs (true)
 //	DEFAULT_TIMEZONE    plant time zone                  (Asia/Singapore)
 package main
 
@@ -48,13 +49,21 @@ const seedKey = "demo_seed"
 // seedVersion is bumped whenever the plant configuration changes; an older
 // installation is upgraded in place (the seeder only adds what is missing and
 // re-applies thresholds, control definitions and changed alarms).
-const seedVersion = 5
+// 6: plant supervisory points and controls on CHWS_01, LBNL fault codes,
+// SOPs and FDD issue relations, AI permission groups.
+const seedVersion = 6
 
 // historyVersion is bumped when the generated history must be regenerated
 // (e.g. new equipment that needs history); this replaces all demo history and
 // orders. A configuration-only upgrade keeps the history: parameters added to
 // existing models get values from the live simulation on.
-const historyVersion = 3
+// 4: supervisory control physics, LBNL fault episodes with FDD orders and
+// operator set point changes.
+const historyVersion = 4
+
+// faultCatalogKey is the core.settings key of the fault catalog the simulator
+// publishes for the backend (fault injection and simulation job validation).
+const faultCatalogKey = "sim_fault_catalog"
 
 type seedMarker struct {
 	Version        int       `json:"version"`
@@ -226,20 +235,32 @@ func doRun(ctx context.Context, db *pgxpool.Pool, c *Client, loc *time.Location,
 		MaxFaults: envInt("SIM_MAX_FAULTS", 4), RampMin: envFloat("SIM_RAMP_MIN", 20), RampMax: envFloat("SIM_RAMP_MAX", 60),
 	}
 	// Faults carried over from the history develop at history speed (days);
-	// bring them to the live pace so they surface within the session.
+	// bring them to the live pace so they surface within the session. Fixed-
+	// intensity (Manual) faults keep their intensity.
 	minRate := 1.25 / (opts.RampMax * 60)
 	for _, a := range plant.Assets {
 		for _, f := range a.Faults {
+			if fs := a.Model.faultSpec(f.Kind); fs != nil && fs.Manual {
+				continue
+			}
 			if f.Rate < minRate {
 				f.Rate = minRate
 			}
 		}
+	}
+	if err := putSetting(ctx, db, faultCatalogKey, faultCatalog(plant)); err != nil {
+		slog.Warn("publish fault catalog", "err", err)
 	}
 	live := newLive(ctx, db, plant, opts, seed)
 	if strings.EqualFold(env("SIM_WORKFORCE", "true"), "true") {
 		bot := newBot(ctx, db, c, plant, live, envDur("SIM_APPROVE_DELAY", 15*time.Minute), loc, seed)
 		go bot.Run()
 		slog.Info("maintenance team simulation enabled")
+	}
+	if strings.EqualFold(env("SIM_JOBS", "true"), "true") {
+		runner := newJobRunner(ctx, db, loc, live.Snapshot, jobOptions(opts))
+		go runner.Run()
+		slog.Info("simulation job runner enabled")
 	}
 	slog.Info("live simulation started", "equipment", len(plant.Assets), "mqtt", opts.MQTTURL, "interval", opts.Interval)
 	return live.Run()
