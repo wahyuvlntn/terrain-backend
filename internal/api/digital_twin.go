@@ -111,7 +111,7 @@ func (s *Server) twinAssetParameters(c *Ctx) (any, error) {
 		}
 		out = append(out, map[string]any{
 			"control": control,
-			"id": p.EPID, "alias": p.Alias, "name": p.Name, "unit": p.Unit, "data_type": p.DataType, "scale": p.Scale,
+			"id":      p.EPID, "alias": p.Alias, "name": p.Name, "unit": p.Unit, "data_type": p.DataType, "scale": p.Scale,
 			"value": value, "timestamp": ts, "condition": cond,
 			"warning":  twinLimits(p.WarnType, p.WarnLower, p.WarnUpper),
 			"critical": twinLimits(p.CritType, p.CritLower, p.CritUpper),
@@ -372,6 +372,13 @@ func (s *Server) twinParameterTrend(c *Ctx) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return twinTrend(p, minutes, pts, running), nil
+}
+
+// twinTrend builds the getparametertrend payload of a series: the points with
+// their running flag, thresholds, statistics and the individuals SPC chart.
+// It is shared by the live trend and the simulation trend (simulation/gettrend).
+func twinTrend(p *epInfo, minutes int64, pts []point, running []bool) map[string]any {
 	// SPC describes the process while the unit runs: samples taken while it was
 	// stopped (standby, trip, maintenance) are kept in the series but excluded
 	// from the limits, the rule checks and the statistics.
@@ -461,7 +468,7 @@ func (s *Server) twinParameterTrend(c *Ctx) (any, error) {
 		"warning":  twinLimits(p.WarnType, p.WarnLower, p.WarnUpper),
 		"critical": twinLimits(p.CritType, p.CritLower, p.CritUpper),
 		"spc":      spc, "stats": stats, "violations": violations,
-	}, nil
+	}
 }
 
 // twinPhaseOne is the in-control baseline of a window (Phase I revised limits):
@@ -498,39 +505,54 @@ func twinPhaseOne(vals []float64) []float64 {
 // average a start or stop stay out of SPC. An equipment without any status row
 // overlapping the window (no status history) counts as running throughout.
 func (s *Server) twinRunningFlags(c *Ctx, assetID int64, pts []point, bucket time.Duration, from, to time.Time) ([]bool, error) {
-	flags := make([]bool, len(pts))
 	rows, err := s.DB.Query(c, `SELECT status_id, start_ts, end_ts FROM ts.asset_status
 		WHERE asset_id = $1 AND start_ts < $3 AND (end_ts IS NULL OR end_ts > $2) ORDER BY start_ts`, assetID, from, to)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	var spans []statusSpan
+	for rows.Next() {
+		var sp statusSpan
+		if err := rows.Scan(&sp.status, &sp.start, &sp.end); err != nil {
+			return nil, err
+		}
+		spans = append(spans, sp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return runningFlags(pts, bucket, spans), nil
+}
+
+// statusSpan is a status interval of an equipment (end nil = still open).
+type statusSpan struct {
+	status int
+	start  time.Time
+	end    *time.Time
+}
+
+// runningFlags applies the rules of twinRunningFlags to the status intervals
+// overlapping the window (no interval = running throughout).
+func runningFlags(pts []point, bucket time.Duration, spans []statusSpan) []bool {
+	flags := make([]bool, len(pts))
 	type span struct {
 		start time.Time
 		end   *time.Time // nil = still open
 	}
 	var runs, others []span
-	seen := false
-	for rows.Next() {
-		var status int
-		var sp span
-		if err := rows.Scan(&status, &sp.start, &sp.end); err != nil {
-			return nil, err
-		}
-		seen = true
-		sp.start = sp.start.Truncate(time.Second)
-		if sp.end != nil {
-			end := sp.end.Truncate(time.Second)
+	seen := len(spans) > 0
+	for _, st := range spans {
+		sp := span{start: st.start.Truncate(time.Second)}
+		if st.end != nil {
+			end := st.end.Truncate(time.Second)
 			sp.end = &end
 		}
-		if status == engine.StatusRunning {
+		if st.status == engine.StatusRunning {
 			runs = append(runs, sp)
 		} else {
 			others = append(others, sp)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	contains := func(r span, t time.Time) bool {
 		return !t.Before(r.start) && (r.end == nil || t.Before(*r.end))
@@ -560,7 +582,7 @@ func (s *Server) twinRunningFlags(c *Ctx, assetID int64, pts []point, bucket tim
 			}
 		}
 	}
-	return flags, nil
+	return flags
 }
 
 func twinLimits(typ string, lower, upper *float64) map[string]any {
