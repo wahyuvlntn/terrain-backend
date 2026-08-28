@@ -88,9 +88,13 @@ func (s *Server) twinControls(ctx context.Context, assetID int64) (map[string]*t
 
 // twinWriteParameter writes a set point or control mode to the plant.
 // Input: parameter_id (equipment parameter), value. Validation failures are
-// recorded and returned as a REJECTED request, not as an HTTP error.
+// recorded and returned as a REJECTED request, not as an HTTP error. Plant
+// writes need a person: the AI agent cannot call this (RequireHuman).
 func (s *Server) twinWriteParameter(c *Ctx) (any, error) {
 	if err := c.Require("digitaltwin", "update"); err != nil {
+		return nil, err
+	}
+	if err := c.RequireHuman(); err != nil {
 		return nil, err
 	}
 	epid := c.F.Int("parameter_id", 0)
@@ -98,7 +102,14 @@ func (s *Server) twinWriteParameter(c *Ctx) (any, error) {
 	if epid <= 0 || vp == nil || math.IsNaN(*vp) || math.IsInf(*vp, 0) {
 		return nil, httpx.BadRequest("A parameter_id and a numeric value are required")
 	}
-	value := *vp
+	return s.twinWrite(c, epid, *vp)
+}
+
+// twinWrite is the write path shared by digital_twin/writeparameter and
+// ai_insights/applyrecommendation: scope check, validation (recorded as a
+// REJECTED request), MQTT command, read-back wait and the final request row.
+// The caller checks the permissions and the human-only guard.
+func (s *Server) twinWrite(c *Ctx, epid int64, value float64) (map[string]any, error) {
 	p, err := s.loadEP(c, epid) // also checks the user's location scope
 	if err != nil {
 		return nil, err
@@ -204,25 +215,11 @@ func (s *Server) twinValidateWrite(c *Ctx, p *epInfo, ctl *twinControl, controls
 		return fmt.Sprintf("No live data from the equipment for %s", age.Round(time.Second))
 	}
 	if len(ctl.Options) > 0 {
-		for _, o := range ctl.Options {
-			if o.Value == value {
-				return ""
-			}
-		}
-		return fmt.Sprintf("%v is not a valid option", value)
+		// A valid option needs no further checks (modes are never gated).
+		return controlValueError(ctl, value, p.Unit)
 	}
-	if ctl.Min != nil && value < *ctl.Min-1e-9 || ctl.Max != nil && value > *ctl.Max+1e-9 {
-		return fmt.Sprintf("Value outside the allowed range %s – %s %s", fmtLimit(ctl.Min), fmtLimit(ctl.Max), p.Unit)
-	}
-	if ctl.Step != nil && *ctl.Step > 0 {
-		base := 0.0
-		if ctl.Min != nil {
-			base = *ctl.Min
-		}
-		n := (value - base) / *ctl.Step
-		if math.Abs(n-math.Round(n)) > 1e-6 {
-			return fmt.Sprintf("Value must be in steps of %v %s", *ctl.Step, p.Unit)
-		}
+	if reason := controlValueError(ctl, value, p.Unit); reason != "" {
+		return reason
 	}
 	if ctl.Mode != nil && *ctl.Mode != "" {
 		var mode *epInfo
@@ -250,6 +247,34 @@ func (s *Server) twinValidateWrite(c *Ctx, p *epInfo, ctl *twinControl, controls
 				}
 			}
 			return fmt.Sprintf("%s is in automatic: switch it to %s first", mode.Name, label)
+		}
+	}
+	return ""
+}
+
+// controlValueError checks a value against a control definition alone (valid
+// option, range, step); "" = valid. Live state (data source, mode gating) is
+// checked by twinValidateWrite.
+func controlValueError(ctl *twinControl, value float64, unit string) string {
+	if len(ctl.Options) > 0 {
+		for _, o := range ctl.Options {
+			if o.Value == value {
+				return ""
+			}
+		}
+		return fmt.Sprintf("%v is not a valid option", value)
+	}
+	if ctl.Min != nil && value < *ctl.Min-1e-9 || ctl.Max != nil && value > *ctl.Max+1e-9 {
+		return fmt.Sprintf("Value outside the allowed range %s – %s %s", fmtLimit(ctl.Min), fmtLimit(ctl.Max), unit)
+	}
+	if ctl.Step != nil && *ctl.Step > 0 {
+		base := 0.0
+		if ctl.Min != nil {
+			base = *ctl.Min
+		}
+		n := (value - base) / *ctl.Step
+		if math.Abs(n-math.Round(n)) > 1e-6 {
+			return fmt.Sprintf("Value must be in steps of %v %s", *ctl.Step, unit)
 		}
 	}
 	return ""
@@ -330,7 +355,7 @@ func scanControlRequest(row interface{ Scan(...any) error }) (map[string]any, er
 	}, nil
 }
 
-func (s *Server) twinControlRequest(ctx context.Context, id int64) (any, error) {
+func (s *Server) twinControlRequest(ctx context.Context, id int64) (map[string]any, error) {
 	return scanControlRequest(s.DB.QueryRow(ctx, twinControlSelect+` WHERE r.id = $1`, id))
 }
 
