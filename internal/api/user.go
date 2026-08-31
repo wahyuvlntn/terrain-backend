@@ -63,6 +63,8 @@ func (s *Server) userGetDetails(c *Ctx) (any, error) {
 		sort.Slice(locs, func(i, j int) bool { return locs[i] < locs[j] })
 	}
 	return map[string]any{
+		"id":                u.ID,
+		"username":          u.Username,
 		"full_name":         u.FullName,
 		"employee_id":       u.EmployeeID,
 		"photo":             photoURL(u.Photo),
