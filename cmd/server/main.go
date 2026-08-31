@@ -152,8 +152,22 @@ func serve() error {
 	}
 	defer database.Close()
 
-	store, err := storage.New(ctx, storage.Options{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey, SecretKey: cfg.MinioSecretKey,
-		Bucket: cfg.MinioBucket, UseSSL: cfg.MinioUseSSL, Region: cfg.MinioRegion})
+	// The AI services log in with these roles; the core backend runs without
+	// them, so a failure is reported but not fatal.
+	if err := db.EnsureServiceRoles(ctx, database, cfg.AIDBPassword, cfg.AIDBROPassword); err != nil {
+		slog.Error("enable AI service database roles", "err", err)
+	}
+
+	storeOpts := storage.Options{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey, SecretKey: cfg.MinioSecretKey,
+		Bucket: cfg.MinioBucket, UseSSL: cfg.MinioUseSSL, Region: cfg.MinioRegion}
+	store, err := storage.New(ctx, storeOpts)
+	if err != nil {
+		return err
+	}
+	// Private bucket of the AI document library (never served under /public).
+	docsOpts := storeOpts
+	docsOpts.Bucket = cfg.DocsBucket
+	docsStore, err := storage.New(ctx, docsOpts)
 	if err != nil {
 		return err
 	}
@@ -220,7 +234,16 @@ func serve() error {
 	eng.SetHooks(maintSvc)
 
 	srv := api.New(api.Deps{Config: cfg, DB: database, Store: store, Auth: authSvc, Notify: notifier, Hub: hub, Engine: eng,
-		Maint: maintSvc, License: licMgr, Broker: mqttBroker})
+		Maint: maintSvc, License: licMgr, Broker: mqttBroker, DocsStore: docsStore})
+
+	sched := scheduler.New(scheduler.Deps{DB: database, Notify: notifier, Maint: maintSvc, CleanSessions: authSvc.CleanupExpired,
+		RefreshKPIs: srv.RefreshKPIs, RetentionDays: cfg.RetentionDays})
+	// The engine logs into monthly partitions of ts.parameter_values: make sure
+	// the current and the coming months exist before it starts. Not fatal: the
+	// migration created months ahead and the scheduled job retries.
+	if err := sched.MaintainPartitions(ctx); err != nil {
+		slog.Error("partition maintenance at start-up", "err", err)
+	}
 
 	engineDone := make(chan struct{})
 	go func() {
@@ -228,8 +251,6 @@ func serve() error {
 		eng.Run(ctx)
 	}()
 
-	sched := scheduler.New(scheduler.Deps{DB: database, Notify: notifier, Maint: maintSvc, CleanSessions: authSvc.CleanupExpired,
-		RefreshKPIs: srv.RefreshKPIs, RetentionDays: cfg.RetentionDays})
 	sched.Start(ctx)
 
 	httpSrv := &http.Server{

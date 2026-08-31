@@ -68,6 +68,10 @@ type Deps struct {
 	Maint   *maint.Service
 	License *license.Manager
 	Broker  *broker.Broker
+	// DocsStore is the private bucket of the RAG documents (MINIO_DOCS_BUCKET).
+	// It is never mounted under /public: PDFs are streamed by
+	// /api/ai/documents/{id}/file after the session and permission checks.
+	DocsStore *storage.Store
 }
 
 // Server is the HTTP API.
@@ -147,6 +151,26 @@ func (c *Ctx) Require(group, alias string) error {
 	return httpx.Forbidden("")
 }
 
+// OriginHeader marks the backend calls the AI agent makes with a user's
+// session ("X-AFDD-Origin: agent"). Such calls carry the user's permissions
+// and scope, but actions that need a person are refused (RequireHuman).
+const OriginHeader = "X-AFDD-Origin"
+
+// RequireHuman returns a 403 error when the request comes from the AI agent
+// (X-AFDD-Origin present, whatever its value): plant writes, approvals and
+// configuration changes must be made by a person in the application.
+func (c *Ctx) RequireHuman() error {
+	if c.fromAgent() {
+		return httpx.Forbidden("This action needs a person: approve it in the application")
+	}
+	return nil
+}
+
+// fromAgent reports whether the request was made by the AI agent.
+func (c *Ctx) fromAgent() bool {
+	return c.R != nil && len(c.R.Header.Values(OriginHeader)) > 0
+}
+
 // Location returns the client's time zone derived from timezone_offset
 // (minutes, as returned by Date#getTimezoneOffset) or the server default.
 func (c *Ctx) Location() *time.Location {
@@ -174,6 +198,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/user-management/exposed/logout", s.serveLogout)
 	mux.HandleFunc("/api/datahub/rest/", s.serveRestIngest)
 	mux.HandleFunc("/healthz", s.serveHealth)
+	// AI assistant (SSE reverse proxy to the agent service) and the RAG
+	// document originals (private bucket, session and permission checked).
+	mux.HandleFunc(agentPrefix+"/", s.serveAgentProxy)
+	mux.HandleFunc("/api/ai/documents/{id}/file", s.serveDocumentFile)
 	if s.Store != nil {
 		mux.Handle(storage.PublicPrefix, s.Store)
 	}
