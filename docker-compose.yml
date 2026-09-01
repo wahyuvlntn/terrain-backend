@@ -9,10 +9,55 @@
 #
 #   docker compose --profile demo up -d --build
 #   docker compose logs -f simulator
+#
+# Agentic AI services (docs/agentic/DESIGN.md): ai-agent, ai-mcp, ai-analytics
+# share one image (afdd-ai:latest) built from ./agentic by ai-agent:
+#
+#   docker compose build ai-agent && docker compose up -d ai-agent ai-mcp ai-analytics
+#
+# Secrets come from the git-ignored .env (GOOGLE_API_KEY, and for anything but a
+# local demo AGENT_SHARED_SECRET, AI_DB_PASSWORD, AI_DB_RO_PASSWORD). The database
+# passwords go into URLs below: use URL-safe characters only.
+
+# Settings shared by the three AI services (afdd_ai/common/config.py).
+x-ai-env: &ai-env
+  DATABASE_URL: postgresql://afdd_ai:${AI_DB_PASSWORD:-afdd-ai-dev}@postgres:5432/afdd
+  DATABASE_URL_RO: postgresql://afdd_ai_ro:${AI_DB_RO_PASSWORD:-afdd-ai-ro-dev}@postgres:5432/afdd
+  AGENT_SESSION_DB_URL: postgresql+asyncpg://afdd_ai:${AI_DB_PASSWORD:-afdd-ai-dev}@postgres:5432/afdd
+  AFDD_API_URL: https://backend:4500
+  AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-afdd-agent-dev-secret}
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  GOOGLE_GENAI_USE_VERTEXAI: "FALSE"
+  AI_MODEL_FAST: ${AI_MODEL_FAST:-gemini-3.5-flash-lite}
+  AI_MODEL_PRO: ${AI_MODEL_PRO:-gemini-3.1-pro-preview}
+  AI_MODEL_LITE: ${AI_MODEL_LITE:-gemini-3.5-flash-lite}
+  AI_EMBED_MODEL: ${AI_EMBED_MODEL:-gemini-embedding-001}
+  AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0.50}
+  AI_MAX_LLM_CALLS: ${AI_MAX_LLM_CALLS:-10}
+  AI_USER_DAILY_BUDGET_USD: ${AI_USER_DAILY_BUDGET_USD:-0.20}
+  AI_ANALYTICS_RESERVE_USD: ${AI_ANALYTICS_RESERVE_USD:-0.10}
+  AGENT_ALLOWED_HOSTS: ${AGENT_ALLOWED_HOSTS:-ai-agent,localhost,127.0.0.1}
+  OPTIMIZER_INTERVAL_MIN: ${OPTIMIZER_INTERVAL_MIN:-60}
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-afddminio}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-afddminio-secret}
+  MINIO_USE_SSL: "false"
+  MINIO_DOCS_BUCKET: ${MINIO_DOCS_BUCKET:-afdd-docs}
+  DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-Asia/Singapore}
+  SITE_CODE: ${SITE_CODE:-SGF1}
+  MCP_DB_URL: http://ai-mcp:8101/mcp
+  MCP_TWIN_URL: http://ai-mcp:8102/mcp
+  LOG_LEVEL: ${AI_LOG_LEVEL:-INFO}
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # postgres:16-alpine (same base as the existing data volume) + pgvector, see docker/postgres
+    build:
+      context: ./docker/postgres
+      args:
+        PGVECTOR_VERSION: "0.8.6"
+    image: afdd-postgres:16.15-pgvector0.8.6
+    shm_size: 256mb # parallel HNSW index builds use /dev/shm
     restart: unless-stopped
     environment:
       POSTGRES_USER: afdd
@@ -20,6 +65,8 @@ services:
       POSTGRES_DB: afdd
     volumes:
       - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432" # localhost only: host-side tests of the AI services
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U afdd -d afdd"]
       interval: 5s
@@ -37,6 +84,7 @@ services:
       - miniodata:/data
     ports:
       - "9001:9001" # MinIO console (optional)
+      - "127.0.0.1:9000:9000" # S3 API, localhost only: host-side tests of the AI services
 
   backend:
     build: .
@@ -62,6 +110,14 @@ services:
       # (otherwise a self-signed certificate is generated).
       TLS_CERT_FILE: ${TLS_CERT_FILE:-}
       TLS_KEY_FILE: ${TLS_KEY_FILE:-}
+      # Agentic AI: /api/agent/ proxy target, shared secret, private documents
+      # bucket, and the login passwords the backend sets on afdd_ai / afdd_ai_ro.
+      AGENT_URL: ${AGENT_URL:-http://ai-agent:8000}
+      AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0.50}
+      AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-afdd-agent-dev-secret}
+      MINIO_DOCS_BUCKET: ${MINIO_DOCS_BUCKET:-afdd-docs}
+      AI_DB_PASSWORD: ${AI_DB_PASSWORD:-afdd-ai-dev}
+      AI_DB_RO_PASSWORD: ${AI_DB_RO_PASSWORD:-afdd-ai-ro-dev}
     volumes:
       - backenddata:/data
       - ./certs:/certs:ro
@@ -92,6 +148,85 @@ services:
       HISTORY_DAYS: ${DEMO_HISTORY_DAYS:-60}
       SIM_WORKFORCE: ${SIM_WORKFORCE:-true}
       DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-Asia/Singapore}
+
+  # AI assistant (Google ADK + FastAPI, SSE). Reached through the backend's
+  # /api/agent/ proxy; the localhost port is for local debugging only.
+  ai-agent:
+    build: ./agentic
+    image: afdd-ai:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      ai-mcp:
+        condition: service_started
+    command: ["uvicorn", "afdd_ai.agent.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *ai-env
+    # not published: only the backend proxy (compose network) talks to the agent
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/healthz', headers={'X-Agent-Secret': os.environ.get('AGENT_SHARED_SECRET', '')}), timeout=4)"
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # MCP servers (streamable HTTP): afdd-db on 8101 (read-only role), afdd-twin on 8102.
+  ai-mcp:
+    image: afdd-ai:latest # built by ai-agent
+    pull_policy: never # local image only (never pulled from a registry)
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "afdd_ai.mcp.serve"]
+    environment:
+      <<: *ai-env
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; [socket.create_connection(('127.0.0.1', port), timeout=3).close() for port in (8101, 8102)]"
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # Analytics worker: anomaly detection, LBNL fault rules, optimizer, RAG
+  # corpus and ingestion, simulation post-analysis.
+  ai-analytics:
+    image: afdd-ai:latest # built by ai-agent
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "afdd_ai.analytics.worker"]
+    healthcheck:
+      # the worker rewrites its health file every 60 s
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/ai-analytics-health.json') < 180 else 1)"
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    environment:
+      <<: *ai-env
+      AI_HEALTH_FILE: /tmp/ai-analytics-health.json
 
 volumes:
   pgdata:
