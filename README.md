@@ -134,9 +134,9 @@ docker compose logs -f simulator              # follow faults, trips and the mai
 | Area | Content |
 |---|---|
 | Locations | FAB1 Wafer Fab (sub-fab bays, MAU plant rooms) and CUB Central Utility Building (chiller plant, PCW pump room, CDA room, cooling tower yard) |
-| Models | Daikin WSC-126 centrifugal chiller, BAC cooling tower, Grundfos PCW pump, Atlas Copco ZR 315 VSD+ compressor, Daikin Vision make-up air unit, Edwards iXH dry pumps (a base model with Etch and CVD extended models) with variables, status scripts, alarms, thresholds and running hour limits |
-| Equipment | 24 units (3 chillers N+1, 3 cooling towers, 4 PCW pumps 3+1, 2 CDA compressors, 6 MAUs, 6 dry pumps) on 3 MQTT data sources (`cub_bms`, `fab1_hvac`, `fab1_subfab`) |
-| Diagnostics | 60 alarm codes, alarm mapping, 21 issue relations (direct, degradation and compound paths) |
+| Models | Daikin WSC-126 centrifugal chiller, BAC cooling tower, Grundfos PCW pump, Grundfos NKG CHW and CW pumps, CUB chilled water plant controller (CHWS), Atlas Copco ZR 315 VSD+ compressor, Daikin Vision make-up air unit, Edwards iXH dry pumps (a base model with Etch and CVD extended models) with variables, status scripts, alarms, thresholds, running hour limits and writable control points |
+| Equipment | 31 units (3 chillers N+1 with dedicated CHW and CW pumps, 3 cooling towers, the CHW plant controller CHWS_01, 4 PCW pumps 3+1, 2 CDA compressors, 6 MAUs, 6 dry pumps) on 3 MQTT data sources (`cub_bms`, `fab1_hvac`, `fab1_subfab`) |
+| Diagnostics | 71 alarm codes (including the LBNL fault codes CHL-011, CT-013, CT-014, CHS-005..008 raised by the AI fault detection), alarm mapping, 34 issue relations (direct, degradation and compound paths) |
 | Instructions | Diagnostic, repair and severity SOPs plus preventive maintenance checklists |
 | People | 14 users in 4 groups with permissions, personnel buildings and equipment types |
 | History | 60 days (`HISTORY_DAYS`): parameter logs, statuses, alarms, early warnings, corrective/preventive orders with work reports, recurring PM schedules, KPIs |
@@ -147,7 +147,12 @@ supervisors `rajesh_kumar` (CUB) and `nurul_aisyah` (FAB1), reliability engineer
 `daniel_wong`, `priya_nair` (FAB1), control room operators `jason_teo` and `siti_rahmah`.
 
 **Live behaviour.** Every 5 seconds the simulator publishes physically consistent values (weather and load
-driven, N+1 duty/standby rotation) to the embedded broker. It injects degradations (condenser fouling,
+driven, N+1 duty/standby rotation) to the embedded broker. The chiller plant runs under a supervisory
+controller (CHWS_01): CHW supply reset and chiller staging, tower fan PI on the condenser water supply,
+the condenser 3-way bypass valve, variable-primary CHW pumps holding the riser DP, and MAU coil coupling.
+Operators can write set points and modes from the digital twin (two-way control), and administrators can
+inject the seven LBNL chiller-plant faults (sensor biases, tower fouling, valve leak / stuck, PI hunting)
+from AI Insights. It injects degradations (condenser fouling,
 refrigerant leak, bearing wear, filter clogging, coil fouling, belt slip, cavitation, impeller wear,
 intercooler fouling, dryer failure, air leaks, by-product deposition, rotor wear, purge blockage, …) that
 develop over 20-60 minutes until the engine raises alarms and early-warning maintenance orders; random trips
@@ -181,6 +186,33 @@ groups in the Notification Manager only if you change their addresses.
 | Session cleanup | 1 h |
 | MTBF / MTTR refresh | 15 min |
 | Retention of raw values and notifications (`RETENTION_DAYS`) | daily |
+| Parameter value partitions (monthly, created 3 months ahead; retention drops whole months) | daily, and at start-up |
+
+## AI services (agentic feature)
+
+Three services share the `afdd-ai` image built from `agentic/` (Python 3.12, Google ADK, Gemini). The design
+is in `docs/agentic/DESIGN.md`.
+
+| Service | Role |
+|---|---|
+| `ai-agent` | The plant assistant: a root agent routing to an insight agent and a digital-twin agent (plus a Pro "deep analyst"), streamed to the browser as SSE through the backend proxy `/api/agent/*`. Conversations are stored in schema `agent`. |
+| `ai-mcp` | MCP servers `afdd-db` (read-only SQL tools, port 8101) and `afdd-twin` (simulation tools, port 8102) used by the agents. |
+| `ai-analytics` | Anomaly detection, LBNL rule-based fault detection with RAG-grounded maintenance instructions, set-point optimisation (LightGBM surrogate + Optuna, validated on the twin), the document corpus and its embeddings (pgvector), and the post-analysis of simulation jobs. |
+
+```bash
+docker compose build ai-agent                              # builds afdd-ai:latest for all three
+docker compose up -d ai-agent ai-mcp ai-analytics
+docker compose logs -f ai-analytics
+```
+
+Settings (in `.env`, read by compose): `GOOGLE_API_KEY` (required for any AI call), `AGENT_SHARED_SECRET`
+(backend proxy to agent; set a random value), `AI_DAILY_BUDGET_USD` (default 0.50, all Gemini spend per
+day), `AI_USER_DAILY_BUDGET_USD` (0.20 per user), `AI_ANALYTICS_RESERVE_USD` (0.10 kept for background
+analytics), `AI_MODEL_FAST` / `AI_MODEL_PRO` (default `gemini-3.5-flash-lite` / `gemini-3.1-pro-preview`).
+Every Gemini call is priced and recorded in `analytics.llm_usage`.
+
+Simulation jobs (what-if scenarios on a copy of the plant) run in the simulator (`SIM_JOBS`, default
+true). The assistant can only propose them; a person approves them in the application.
 
 ## Tests
 
@@ -196,3 +228,15 @@ populated database, an end-to-end scenario (master data → locations → models
 equipment → live data → engine → alarms → early warning → maintenance lifecycle → notifications →
 themes → licenses → scheduler jobs), e-mail digests against an SMTP server, and protocol tests against
 real MQTT, Modbus TCP, OPC UA and HTTP servers. Set `AFDD_TEST_KEEP_DB=<name>` to keep the populated database for manual exploration.
+
+More database-backed suites: `cmd/simulator` (`AFDD_TEST_DATABASE_URL`, creates its own scratch databases),
+`internal/api` and `internal/engine` agentic tests (`AFDD_API_TEST_DATABASE_URL`, a scratch copy of a seeded
+database whose name contains `scratch` or `test`). The Python services have their own suite:
+
+```bash
+cd agentic && python -m venv .venv && .venv/Scripts/pip install --isolated -r requirements.txt
+.venv/Scripts/python -m pytest tests -q      # needs Postgres on 127.0.0.1:5432 and MinIO on 127.0.0.1:9000
+```
+
+No test calls Gemini (models are scripted); `AFDD_TEST_REAL_EMBEDDINGS=1` opts in to one tiny embedding
+test. Tests that write the live work queues skip themselves while the `ai-analytics` container runs.
