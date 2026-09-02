@@ -1,16 +1,18 @@
 """The agent tree of the plant assistant (DESIGN 6.3), on Google ADK 2.11.
 
-    plant_assistant (root, fast model, thinking budget AI_THINKING_BUDGET_ROOT)
+    plant_assistant (root, fast model, thinking budget AI_THINKING_BUDGET_ROOT): open_in_app
     ├── insight_agent (fast, AI_THINKING_BUDGET_FAST): backend API tools, charts, RAG,
-    │   McpToolset -> afdd-db, deep_analyst as a single-turn agent tool
+    │   McpToolset -> afdd-db, open_in_app, deep_analyst as a single-turn agent tool
     │   └── deep_analyst (pro model, AI_THINKING_BUDGET_PRO, mode single_turn)
-    └── twin_agent (fast, AI_THINKING_BUDGET_FAST): McpToolset -> afdd-twin, RAG
+    └── twin_agent (fast, AI_THINKING_BUDGET_FAST): McpToolset -> afdd-twin, RAG, open_in_app
 
 The root and its two specialists are chat-mode agents (ADK transfers the
 conversation between them). deep_analyst is a `single_turn` sub-agent of the
 insight agent: ADK exposes it to its parent as an agent tool
 (`_SingleTurnAgentTool`, an `AgentTool`) that runs one isolated turn on the
-request text only. Every agent shares the budget callbacks (`budget.py`).
+request text only. Every agent shares the budget callbacks (`budget.py`). The
+three chat agents can open a page of the application for the user
+(`navigation.open_in_app`), so the root answers a pure navigation request itself.
 
 MCP calls carry the user's session as `Authorization: Bearer` plus the shared
 `X-Agent-Secret`, read per call from `temp:` state by the header provider, so
@@ -32,7 +34,7 @@ from google.genai import types
 
 from ..common.config import Settings, get_settings
 from ..common.gemini import sampling_temperature, thinking_config
-from . import budget, charts, context, prompts, rag_tool, tools_backend
+from . import budget, charts, context, navigation, prompts, rag_tool, tools_backend
 from . import state as st
 
 log = logging.getLogger(__name__)
@@ -182,6 +184,7 @@ def build_root_agent(
             charts.chart_compare,
             charts.make_chart,
             rag_tool.search_documents,
+            navigation.open_in_app,
             mcp_toolset(mcp_db_url or s.mcp_db_url, s, INSIGHT_DB_TOOLS),
         ],
         sub_agents=[deep],
@@ -197,16 +200,17 @@ def build_root_agent(
         ),
         model=model_for(TWIN, s.model_fast),
         instruction=prompts.twin_instruction,
-        tools=[mcp_toolset(mcp_twin_url or s.mcp_twin_url, s), rag_tool.search_documents],
+        tools=[mcp_toolset(mcp_twin_url or s.mcp_twin_url, s), rag_tool.search_documents, navigation.open_in_app],
         generate_content_config=_config(s.model_fast, s.thinking_budget_fast, 4096),
         **callbacks(s.model_fast),
     )
 
     return LlmAgent(
         name=ROOT,
-        description="Plant assistant: greets and routes questions to the specialists.",
+        description="Plant assistant: greets, opens pages of the application and routes questions to the specialists.",
         model=model_for(ROOT, s.model_fast),
         instruction=prompts.root_instruction,
+        tools=[navigation.open_in_app],
         sub_agents=[insight, twin],
         generate_content_config=_config(s.model_fast, s.thinking_budget_root, 1024),
         **callbacks(s.model_fast),
