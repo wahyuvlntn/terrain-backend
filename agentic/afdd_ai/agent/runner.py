@@ -9,10 +9,12 @@ so a user only ever sees, continues or deletes their own conversations. The
 conversation title is the first user message, stored in session state.
 
 A turn runs the ADK `Runner` in SSE streaming mode with the per-request identity
-as `temp:` state (`state.Identity.state_delta`) and the model-call cap from
-`AI_MAX_LLM_CALLS`, and yields normalised SSE (event, data) pairs. One turn per
-conversation at a time: `prepare_chat` takes the conversation's lock (409 when
-it is held) and the turn releases it when it ends.
+(`state.Identity.state_delta`) and the parts of the UI context the tools act on
+(twin walk mode, replayed simulation job: `navigation.ui_state`) as `temp:`
+state, and the model-call cap from `AI_MAX_LLM_CALLS`, and yields normalised SSE
+(event, data) pairs. One turn per conversation at a time: `prepare_chat` takes
+the conversation's lock (409 when it is held) and the turn releases it when it
+ends.
 
 When the client leaves (`ChatTurn.abort`), the turn stops forwarding events but
 lets the model call in flight finish, so its usage is recorded (Gemini bills it
@@ -42,7 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..common import gemini
 from ..common.config import Settings, get_settings
-from . import budget, stream
+from . import budget, navigation, stream
 from . import state as st
 from .backend_api import plant_tz
 from .agents import APP_NAME, DEEP, INSIGHT, ROOT, TWIN, build_root_agent
@@ -65,6 +67,7 @@ class ChatContext(BaseModel):
     node_id: str | int | None = None
     asset_alias: str | None = None
     replay_job_id: str | int | None = None
+    view: str | None = None  # "walk" while the twin is in first-person walk mode
 
 
 class ChatRequest(BaseModel):
@@ -178,7 +181,7 @@ class ChatTurn:
                     user_id=self.identity.username,
                     session_id=self.session_id,
                     new_message=stream.build_user_content(self.message, self.context, datetime.now(plant_tz())),
-                    state_delta=self.identity.state_delta(),
+                    state_delta={**self.identity.state_delta(), **navigation.ui_state(self.context)},
                     run_config=run_config,
                     abort_signal=stop,
                 )

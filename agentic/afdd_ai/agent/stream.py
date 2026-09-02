@@ -5,8 +5,8 @@ Live (`StreamNormaliser.feed`):
 * final text of one model turn  -> `message` {text, agent} (replaces that turn's deltas)
 * function call                 -> `tool_call` {id, name, agent, args} (args sanitised)
 * function response             -> `tool_result` {id, name, agent, ok, summary}, plus
-  `chart` (a tool's {"chart": …}), `citations` (search_documents results) and
-  `simulation` (propose_simulation result)
+  `chart` (a tool's {"chart": …}), `citations` (search_documents results),
+  `simulation` (propose_simulation result) and `navigate` (open_in_app target)
 * author change / transfer      -> `agent` {name}
 * model error / budget refusal  -> `error` {message}
 Thought parts are never forwarded; the deep analyst's own text is internal (its
@@ -34,6 +34,7 @@ from ..common import gemini
 from . import budget
 from .agents import INTERNAL_AGENTS
 from .charts import validate_option
+from .navigation import navigation_item
 from .rag_tool import citation_items
 
 log = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ SEARCH_TOOLS = frozenset({"search_documents"})
 # call_app_api scripts whose result carries a stored, cited maintenance instruction
 INSTRUCTION_SCRIPTS = frozenset({"ai_insights/getfault"})
 PROPOSE_TOOLS = frozenset({"propose_simulation"})
+NAVIGATE_TOOLS = frozenset({"open_in_app"})
 
 _SENSITIVE_KEY = re.compile(r"token|session|secret|password|passwd|authori[sz]ation|cookie|api[_-]?key|credential", re.I)
 _CONTEXT_SAFE = re.compile(r"[^A-Za-z0-9 _\-./:#@]")
@@ -105,6 +107,7 @@ def format_context(context: Mapping[str, Any] | None, now: datetime | None = Non
         ("page", _ctx_value(context.get("page"), 40)),
         ("selected node", _ctx_value(context.get("node_id"), 80)),
         ("selected asset", _ctx_value(context.get("asset_alias"), 40)),
+        ("view", _ctx_value(context.get("view"), 10)),
         ("replay simulation job", _ctx_value(context.get("replay_job_id"), 20)),
         ("plant time", f"{now:%Y-%m-%d %H:%M} (UTC{now:%z})" if now is not None else None),
     ]
@@ -195,6 +198,8 @@ def summarise(name: str, payload: Any, ok: bool, error: str | None) -> str:
             return f"Chart: {chart.get('title')}"[:240]
         if name in PROPOSE_TOOLS and payload.get("job_id") is not None:
             return f"Simulation #{payload.get('job_id')} {payload.get('status') or ''}".strip()
+        if name in NAVIGATE_TOOLS and (nav := navigation_item(payload)) is not None:
+            return f"Opened: {nav['label']}"[:240]
         if name in SEARCH_TOOLS and isinstance(payload.get("results"), list):
             return f"{len(payload['results'])} document passages"
         for key in ("count", "total"):
@@ -236,7 +241,7 @@ def _simulation(payload: Any) -> dict[str, Any] | None:
 
 
 def result_items(name: str, payload: Any, ok: bool) -> list[tuple[str, dict[str, Any]]]:
-    """`chart` / `citations` / `simulation` events carried by one tool result."""
+    """`chart` / `citations` / `simulation` / `navigate` events carried by one tool result."""
     if not ok:
         return []
     out: list[tuple[str, dict[str, Any]]] = []
@@ -250,6 +255,8 @@ def result_items(name: str, payload: Any, ok: bool) -> list[tuple[str, dict[str,
         out.append(("citations", {"items": items}))
     if name in PROPOSE_TOOLS and (sim := _simulation(payload)) is not None:
         out.append(("simulation", sim))
+    if name in NAVIGATE_TOOLS and (nav := navigation_item(payload)) is not None:
+        out.append(("navigate", nav))
     return out
 
 
@@ -391,6 +398,7 @@ def _new_message(event: Event, role: str) -> dict[str, Any]:
         "charts": [],
         "citations": [],
         "simulations": [],
+        "navigations": [],
         "tool_calls": [],
         "created_at": iso(event.timestamp),
     }
@@ -461,5 +469,7 @@ def history_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                     current["citations"].extend(data["items"])
                 elif kind == "simulation":
                     current["simulations"].append(data)
+                elif kind == "navigate":
+                    current["navigations"].append(data)
     close()
     return messages

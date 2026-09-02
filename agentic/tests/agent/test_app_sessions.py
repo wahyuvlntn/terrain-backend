@@ -124,7 +124,8 @@ async def test_sessions_persist_in_agent_schema_and_history_is_rebuilt(client, s
     a = msgs[1]
     assert a["agent"] == INSIGHT and len(a["charts"]) == 1 and a["charts"][0]["option"]["series"][0]["data"]
     assert [t["name"] for t in a["tool_calls"]] == ["get_parameter_trend", DEEP] and all(t["ok"] for t in a["tool_calls"])
-    assert set(a) == {"id", "role", "text", "agent", "charts", "citations", "simulations", "tool_calls", "created_at"}
+    assert set(a) == {"id", "role", "text", "agent", "charts", "citations", "simulations", "navigations", "tool_calls", "created_at"}
+    assert a["navigations"] == []
 
     # Another user cannot see, continue or delete it.
     other = {**HEADERS, "X-AFDD-Session": "tok-admin", "X-AFDD-Username": "admin_test", "X-AFDD-User-Id": ""}
