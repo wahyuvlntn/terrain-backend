@@ -6,7 +6,8 @@ says who the user is and what they may do. It stays the same for the whole
 conversation: Gemini caches a prompt by its prefix, so anything that changes
 per turn (the current plant time) goes in the `[UI context]` line of the user
 message instead (stream.build_user_content). The header carries no secrets: the
-session token never reaches a prompt.
+session token never reaches a prompt. The NAVIGATION block (open_in_app) is the
+same static text for the three chat agents.
 """
 
 from __future__ import annotations
@@ -61,6 +62,42 @@ sensor bias, CT-014 tower fouling, CHS-005 riser dP sensor bias, CHS-006 condens
 CHS-007 3-way valve stuck, CHS-008 CW supply temperature loop hunting (PI tuning).
 """
 
+NAVIGATION = """\
+NAVIGATION (open_in_app)
+open_in_app opens a page of the application for the user; the browser follows at once.
+- Use it only when the user asks to open, show or go to a page, place or piece of equipment in the application,
+  to take them somewhere, where something is, to walk to something, or for first-person / walk mode. Never
+  navigate on your own initiative. A question about data ("show the CHWST trend") is answered in the chat.
+- At most one open_in_app call per answer. Afterwards say in one short sentence what is now shown (its
+  "label"); do not repeat the page's content. On an error, correct the arguments as the error says or tell the
+  user what cannot be opened.
+- Pages and their fields (other fields are ignored):
+  digital-twin (3D twin): asset (alias), parameter (alias of that asset's point; opens its instrument), location,
+    view ("walk" = first-person walk mode, "orbit" = leave walk mode), panel ("plant-overview" = BMS chiller plant
+    overview).
+  ai-insights: tab (recommendations, faults, anomalies, documents, rules, injection = fault injection, administrators
+    only), item_id (recommendation, fault or anomaly id from a tool result, with its tab).
+  simulation: item_id (simulation job id), section "new" (scenario builder).
+  asset-overview (equipment overview; with asset that unit's detail page): asset, section (status, parameters, spc).
+  alarm-report, maintenance-order, maintenance-performance, maintenance-instruction, location-overview,
+    early-warning-and-diagnostics, early-warning-dashboard, personnel-management: no fields.
+- Equipment aliases: CH_01..03, CHWP_01..03, CWP_01..03, CT_01..03, CHWS_01 (modelled in 3D); PCWP_01..04,
+  CDA_01..02, MAU_01..06, DP_01..06 (not modelled in 3D yet).
+- Locations, [3D] = has a 3D model: CUB Central Utility Building [3D, whole building], CUB L1 Utility Floor [3D],
+  Chiller Plant Room [3D], PCW Pump Room [3D, empty room], CDA Compressor Room [3D, empty room], CUB Roof [3D],
+  Cooling Tower Yard [3D]; FAB1 Wafer Fab, FAB1 L1 Sub-Fab, Sub-Fab Bay A (Etch), Sub-Fab Bay B (CVD), FAB1 L4
+  Mechanical Deck, MAU Plant Room North, MAU Plant Room South (no 3D yet).
+- Walk mode: the user walks through the 3D twin in first person (W A S D move, mouse look, E selects, T opens this
+  assistant, G teleports to the newest live alarm). "view=walk" in the [UI context] line means the user is
+  walking; a twin target without view keeps them walking. Pass view "orbit" only when they ask to leave walk mode.
+- "replay simulation job=N" with page=digital-twin: the twin replays a simulation; a twin navigation stays in
+  that replay and shows the replayed run, not live data (the result's note says so).
+- Examples: "show me CT-01's fan speed in the twin" -> digital-twin, asset CT_01, parameter fan_speed; "walk me to
+  CH_02" -> digital-twin, asset CH_02, view walk; "take me to the tower yard" -> digital-twin, location Cooling
+  Tower Yard; "open fault #43" -> ai-insights, tab faults, item_id 43; "open the plant overview" -> digital-twin,
+  panel plant-overview.
+"""
+
 SAFETY = """\
 RULES
 - Facts about the plant come only from your tools. Never guess or invent a number, unit, status, time or
@@ -95,6 +132,9 @@ talk and short general HVAC questions, and route every plant question to a speci
 Transfer immediately when the question needs plant data, documents or simulations; do not answer such
 questions yourself and do not announce the transfer at length. General HVAC explanations you may give
 briefly, marked as general knowledge.
+A pure navigation request (open a page, show a unit or place in the twin, walk mode) you handle yourself
+with open_in_app, without transferring; when it also needs plant data, transfer (the specialists can open
+pages too).
 """
 
 INSIGHT = """\
@@ -204,7 +244,7 @@ def _header(ctx: ReadonlyContext) -> str:
 
 
 def _provider(body: str, *, plant: bool = True) -> Callable[[ReadonlyContext], str]:
-    text = body + ("\n" + PLANT_CONTEXT if plant else "") + "\n" + SAFETY
+    text = body + ("\n" + PLANT_CONTEXT if plant else "") + "\n" + NAVIGATION + "\n" + SAFETY
 
     def provide(ctx: ReadonlyContext) -> str:
         return _header(ctx) + text
