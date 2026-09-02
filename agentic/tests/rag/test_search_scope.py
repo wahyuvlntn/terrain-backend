@@ -68,8 +68,10 @@ async def test_search_scope_matches_the_backend_document_scope():
     # documents at building level (the generated manuals) are not in a room-level user's scope (no ancestors)
     building_docs = {d for d, row in docs.items() if row["location_id"] == building and row["asset_id"] is None and row["unit"] is None}
     if building_docs:
-        for_room = await search.search("technical manual", k=50, filters={"site_code": site}, allowed_location_ids=[room], query_embedding=query_vector(7))
-        for_building = await search.search("technical manual", k=50, filters={"site_code": site}, allowed_location_ids=[building], query_embedding=query_vector(7))
+        # query with a building-level document's own title, so the lexical half matches it whatever its type
+        title = await db.fetch_val("SELECT title FROM rag.documents WHERE id = %s", (min(building_docs),))
+        for_room = await search.search(title, k=50, filters={"site_code": site}, allowed_location_ids=[room], query_embedding=query_vector(7))
+        for_building = await search.search(title, k=50, filters={"site_code": site}, allowed_location_ids=[building], query_embedding=query_vector(7))
         assert not {r["document_id"] for r in for_room} & building_docs
         assert {r["document_id"] for r in for_building} & building_docs
 
