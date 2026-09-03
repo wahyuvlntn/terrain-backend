@@ -98,9 +98,10 @@ LOCATIONS = (
 LOCATIONS_3D = frozenset(
     {"CUB Central Utility Building", "CUB L1 Utility Floor", "Chiller Plant Room", "PCW Pump Room", "CDA Compressor Room", "CUB Roof", "Cooling Tower Yard"}
 )
-# Equipment kinds (alias prefix) with a 3D model in the twin; PCWP / CDA rooms are empty shells.
-MODELLED_KINDS = frozenset({"CH", "CHWP", "CWP", "CT", "CHWS"})
-ROOM_ONLY_KINDS = {"PCWP": "PCW Pump Room", "CDA": "CDA Compressor Room"}
+# Equipment kinds (alias prefix) with a 3D model in the twin (every CUB unit since 2026-10-12).
+MODELLED_KINDS = frozenset({"CH", "CHWP", "CWP", "CT", "CHWS", "PCWP", "CDA"})
+# Unmodelled kinds whose room has a 3D scene: the twin shows the room (none at the moment).
+ROOM_ONLY_KINDS: dict[str, str] = {}
 # The location whose 3D scene holds the plant the BMS plant overview shows (CHWS_01).
 PLANT_ROOM = "Chiller Plant Room"
 

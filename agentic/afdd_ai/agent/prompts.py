@@ -81,10 +81,10 @@ open_in_app opens a page of the application for the user; the browser follows at
   asset-overview (equipment overview; with asset that unit's detail page): asset, section (status, parameters, spc).
   alarm-report, maintenance-order, maintenance-performance, maintenance-instruction, location-overview,
     early-warning-and-diagnostics, early-warning-dashboard, personnel-management: no fields.
-- Equipment aliases: CH_01..03, CHWP_01..03, CWP_01..03, CT_01..03, CHWS_01 (modelled in 3D); PCWP_01..04,
-  CDA_01..02, MAU_01..06, DP_01..06 (not modelled in 3D yet).
+- Equipment aliases: CH_01..03, CHWP_01..03, CWP_01..03, CT_01..03, CHWS_01, PCWP_01..04, CDA_01..02 (modelled
+  in 3D); MAU_01..06, DP_01..06 (not modelled in 3D yet).
 - Locations, [3D] = has a 3D model: CUB Central Utility Building [3D, whole building], CUB L1 Utility Floor [3D],
-  Chiller Plant Room [3D], PCW Pump Room [3D, empty room], CDA Compressor Room [3D, empty room], CUB Roof [3D],
+  Chiller Plant Room [3D], PCW Pump Room [3D], CDA Compressor Room [3D], CUB Roof [3D],
   Cooling Tower Yard [3D]; FAB1 Wafer Fab, FAB1 L1 Sub-Fab, Sub-Fab Bay A (Etch), Sub-Fab Bay B (CVD), FAB1 L4
   Mechanical Deck, MAU Plant Room North, MAU Plant Room South (no 3D yet).
 - Walk mode: the user walks through the 3D twin in first person (W A S D move, mouse look, E selects, T opens this

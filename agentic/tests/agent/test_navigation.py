@@ -147,15 +147,29 @@ async def test_units_and_places_without_3d_models_are_flagged(fake_backend):
         assert mau["navigation"]["label"] == "MAU-01 in the digital twin" and "MAU_01 is not modelled in 3D yet" in mau["note"]
         walk = await open_(page="digital-twin", asset="MAU_01", view="walk")  # nowhere to stand: refused like a location
         assert "MAU_01 has no 3D model (nor has its location), so walk mode cannot go there" in walk["error"]
-        pcw = await open_(page="digital-twin", asset="pcwp-2", view="walk")  # its room has a 3D model
+        pcw = await open_(page="digital-twin", asset="pcwp-2", view="walk")  # modelled since the PCW room was built
         assert pcw["navigation"]["asset_id"] == 32 and pcw["navigation"]["view"] == "walk"
-        assert "the twin shows its room (PCW Pump Room)" in pcw["note"]
+        assert "3D" not in pcw["note"]
         walking = await open_(ctx(walk=True), page="digital-twin", asset="MAU_01")
         assert walking["navigation"]["view"] is None and "the twin leaves it" in walking["note"]
         ct = await open_(page="digital-twin", asset="CT_01")
         assert "3D" not in ct["note"]
         fab = await open_(page="digital-twin", location="sub-fab bay a (etch)")
         assert fab["navigation"]["location"] == "Sub-Fab Bay A (Etch)" and "has no 3D model yet" in fab["note"]
+    finally:
+        fake_backend._install_defaults()
+
+
+async def test_unmodelled_unit_in_a_3d_room_is_shown_in_its_room(fake_backend, monkeypatch):
+    # no such unit today (every CUB unit is modelled): the path stays for rooms built before their equipment
+    monkeypatch.setattr(navigation, "MODELLED_KINDS", navigation.MODELLED_KINDS - {"PCWP"})
+    monkeypatch.setattr(navigation, "ROOM_ONLY_KINDS", {"PCWP": "PCW Pump Room"})
+    extra = [{**ASSETS[0], "id": 32, "alias": "PCWP_02", "name": "PCW Pump PCWP-02", "type_name": "Process Cooling Water Pump"}]
+    fake_backend.handlers["digital_twin/getassets"] = lambda body, tok: ASSETS + extra
+    try:
+        pcw = await open_(page="digital-twin", asset="pcwp-2", view="walk")
+        assert pcw["navigation"]["asset_id"] == 32 and pcw["navigation"]["view"] == "walk"
+        assert "the twin shows its room (PCW Pump Room)" in pcw["note"]
     finally:
         fake_backend._install_defaults()
 
