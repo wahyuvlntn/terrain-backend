@@ -517,15 +517,16 @@ REJECTED. `actions` are the writes to apply (modes to Manual first where needed)
 
 ADK 2.11 (`google-adk[db,mcp]`), Gemini API key. `App(name="afdd_plant_assistant")`.
 
-* `plant_assistant` (root, `AI_MODEL_FAST`, thinking budget 0): greets, answers small talk, routes:
+* `plant_assistant` (root, `AI_MODEL_FAST`, thinking budget 0): greets, answers small talk, handles pure
+  navigation requests itself (`open_in_app`), routes:
   plant data / alarms / maintenance / documents / charts → `insight_agent`; future scenarios,
   what-if, simulations, recommendations to test → `twin_agent`.
 * `insight_agent` (`AI_MODEL_FAST`, thinking 512): tools = backend API tools (below), RAG `search_documents`,
-  chart tools, `McpToolset` → `afdd-db`, and `AgentTool(deep_analyst)`.
+  chart tools, `open_in_app`, `McpToolset` → `afdd-db`, and `AgentTool(deep_analyst)`.
 * `deep_analyst` (`AI_MODEL_PRO`, thinking 1024, `mode single_turn`): long summaries / complex analysis
   over data the insight agent passes in.
 * `twin_agent` (`AI_MODEL_FAST`, thinking 512): `McpToolset` → `afdd-twin` (state, catalog, propose,
-  status, results), latest recommendation, RAG over past reports, conditions forecast. **Never** claims a
+  status, results), latest recommendation, RAG over past reports, conditions forecast, `open_in_app`. **Never** claims a
   simulation ran unless `get_simulation_status` says so. Proposes with a rationale citing the optimizer
   and documents.
 
@@ -541,6 +542,52 @@ Chart tools (`agent/charts.py`): `chart_parameter_trend(asset, params[], hours)`
 ECharts option (no functions / HTML), cap 2,000 points per series; responses carry `{"chart": {"id",
 "title", "option"}}`.
 
+Navigation tool (`agent/navigation.py`, given to `plant_assistant`, `insight_agent` and `twin_agent`):
+`open_in_app(page, label, asset, parameter, location, tab, item_id, view, panel, section)` opens a page of the
+application for the user; it changes nothing in the plant. Pages and the fields that apply:
+
+| page | fields |
+|---|---|
+| `digital-twin` | `asset`, `parameter` (with asset), `location`, `view` (`walk` = first-person walk mode, `orbit` = leave it), `panel` (`plant-overview`) |
+| `ai-insights` | `tab` (`recommendations`, `faults`, `anomalies`, `documents`, `rules`, `injection`), `item_id` (with one of the first three tabs) |
+| `simulation` | `item_id` (job id), `section` `new` (scenario builder; dropped when a job id is given) |
+| `asset-overview` | `asset` (→ `asset_id`, the detail page), `section` (`status`, `parameters`, `spc`; only with asset) |
+| `alarm-report`, `maintenance-order`, `maintenance-performance`, `maintenance-instruction`, `location-overview`, `early-warning-and-diagnostics`, `early-warning-dashboard`, `personnel-management` | — |
+
+Validation runs as the user: the page needs `<permission group>.read` of its route (`digitaltwin`,
+`aiinsights`, `simulation`, `equipmentoverview`, `alarmsreport`, `maintenanceorder`, …); `asset` must be
+visible (`digital_twin/getassets`; returns the canonical alias and `asset_id`); `parameter` must be one of
+that asset's parameters (`digital_twin/getassetparameters`; canonical alias); `location` must be one of the
+user's visible locations (`filter/getalllocationsandassets`, the location scope, cached 30 s per user;
+case-insensitive, a unique partial name is accepted; canonical name; a plant location outside the scope is
+refused as such); `panel: plant-overview` needs the Chiller Plant Room in the scope (the overview's plant);
+`tab: injection` (fault injection) is for administrators only (permission `admin`, as the page shows it);
+`tab`, `view`, `panel`, `section` are enums (a few spellings such as "first person" or "BMS overview" are
+mapped). Fields that don't apply to the page are set to null and named in the `note`; with both asset and
+location on the twin, the asset wins. Walk mode needs a 3D place: a location with a 3D model (CUB building, L1
+floor, its three rooms, CUB Roof, Cooling Tower Yard), modelled equipment (CH, CHWP, CWP, CT, CHWS) or
+equipment whose room has a 3D shell (PCWP, CDA); `view: walk` to anything else (MAU, DP, the FAB1
+locations) is refused. One successful call per answer (`temp:navigated` = invocation id, shared by the agents
+of one answer): the call claims it before anything is awaited, so of several calls in one model response
+(ADK runs them concurrently) the first wins and the others are refused; a call that fails gives the claim
+back. Success: `{"navigation": {page, label, asset, asset_id, parameter, location, tab, item_id, view, panel,
+section}, "status": "opened", "note": "…"}`; failures: `{"error": "…"}`. The model's `label` is used only when
+no field was ignored or dropped, else (and when none is given) a default such as "CT-01 Fan Speed in the
+digital twin"; equipment without a 3D model is mentioned in the note.
+
+UI context for the tool: the runner passes the request's `view` and `replay_job_id` (only with
+`page=digital-twin`; the simulation page sends its selected job as `replay_job_id` too) as `temp:ui_view` /
+`temp:ui_replay_job` on every turn (`navigation.ui_state`). While the user walks, a twin target without
+`view` gets `view: "walk"` (only `orbit` leaves walk mode; a target with nothing in 3D leaves it, with a
+note). During a replay a twin target stays in that replay (the assistant UI keeps the replay's `replay`,
+`variant` and `t` URL parameters when it navigates from a replaying twin): its label ends in
+"(replay of simulation #N)" and the note tells the model the view shows the replayed run, not live data.
+
+The prompts share one static `NAVIGATION` block (pages, fields, aliases, locations with [3D] marks, walk mode,
+replay, examples): navigate only when the user asks to open / show / go to / take me to / where is / walk to
+something or for walk mode, at most once per answer, then say in one short sentence what is shown; the root
+handles pure navigation requests itself.
+
 Budget: `before_model_callback` refuses an agent call when today's spend ≥ `AI_DAILY_BUDGET_USD` −
 `AI_ANALYTICS_RESERVE_USD` (0.10, kept for the worker) or the user's own spend ≥ `AI_USER_DAILY_BUDGET_USD`
 (0.20); `after_model_callback` records usage (cached prompt tokens at the cache rate);
@@ -553,9 +600,9 @@ HTTP API (only reachable through the backend proxy; requires `X-Agent-Secret`):
 
 | route | body / response |
 |---|---|
-| `POST /chat` | `{session_id?, message, context?: {page, node_id, asset_alias, replay_job_id}}` → SSE stream (6.4) |
+| `POST /chat` | `{session_id?, message, context?: {page, node_id, asset_alias, replay_job_id, view}}` → SSE stream (6.4); `view` is `"walk"` while the twin is in walk mode (`[UI context] … view=walk`, max 10 characters); `view` and `replay_job_id` also reach `open_in_app` as `temp:` state (navigation tool above) |
 | `GET /sessions` | `[{id, title, updated_at}]` for the user |
-| `GET /sessions/{id}` | `{id, title, messages:[{id, role, text, agent, charts[], citations[], simulations[], tool_calls[], created_at}]}` |
+| `GET /sessions/{id}` | `{id, title, messages:[{id, role, text, agent, charts[], citations[], simulations[], navigations[], tool_calls[], created_at}]}`; `navigations` holds the `navigate` targets of the answer (always present, possibly empty) |
 | `DELETE /sessions/{id}` | `{ok: true}` |
 | `GET /healthz` | `{status}` |
 
@@ -572,6 +619,7 @@ HTTP API (only reachable through the backend proxy; requires `X-Agent-Secret`):
 | `chart` | `{id, title, option}` |
 | `citations` | `{items:[{document_id, title, doc_type, page, snippet, score}]}` |
 | `simulation` | `{job_id, title, status, approval_required, rationale, spec_summary}` |
+| `navigate` | `{page, label, asset, asset_id, parameter, location, tab, item_id, view, panel, section}` (a successful `open_in_app`; unset keys null; the assistant UI builds the app URL and follows it) |
 | `usage` | `{input_tokens, output_tokens, cost_usd, today_usd, limit_usd}` |
 | `error` | `{message}` |
 | `done` | `{}` |

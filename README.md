@@ -163,6 +163,15 @@ work, posts work updates, completes and closes orders as the demo users - but on
 for a while (`SIM_APPROVE_DELAY`, 15 minutes), so you can always handle an order yourself. Set
 `SIM_WORKFORCE=false` to do all maintenance by hand.
 
+**Live event feed.** The digital twin's walk mode polls `digital_twin/getliveevents` (`since`, `limit`; needs
+`digitaltwin.read`, location scope applies) for new alarms, FDD faults, anomalies and trips, newest first;
+`since` is compared with the time an event became known to the backend, so back-dated detections still arrive.
+FDD faults and anomalies need `aiinsights.read` too: such users get an FDD fault once, as the fault (not also as
+its `ext:fdd` alarm), while users without it get the `ext:fdd` alarm instead. An anomaly or fault that escalates to
+CRITICAL in place is announced once more as `<kind>:<id>:critical`. An alarm or trip that goes on after its
+equipment was offline (a backend restart, a communication loss) continues the earlier event, and events that exist
+when the backend starts are not announced again.
+
 Useful commands:
 
 ```bash
