@@ -23,6 +23,7 @@ func (s *Server) registerAll() {
 	s.registerDigitalTwin()
 	s.registerDigitalTwinControl()
 	s.registerDigitalTwinFaults()
+	s.registerDigitalTwinEvents()
 	s.registerSimulation()
 	s.registerAIInsights()
 	s.registerAIDocuments()
