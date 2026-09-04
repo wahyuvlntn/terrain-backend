@@ -96,7 +96,7 @@ func (e *apiEnv) do(user, script string, body map[string]any, multipartForm bool
 	} else {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
-	req, _ := http.NewRequest(http.MethodPost, e.http.URL+"/api/js-service/exposed/execute/nlx/afdd_daikin/"+script, &buf)
+	req, _ := http.NewRequest(http.MethodPost, e.http.URL+"/api/js-service/exposed/execute/local/digital_twin_afdd/"+script, &buf)
 	req.Header.Set("Content-Type", ct)
 	if user != "" {
 		req.Header.Set(auth.SessionHeader, e.tokens[user])
@@ -189,11 +189,11 @@ func setupAPIEnv(t *testing.T) *apiEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{OrgAlias: "nlx", ProjectAlias: "afdd_daikin", DefaultTimezone: "Asia/Singapore", ScriptTimeout: time.Second}
+	cfg := &config.Config{OrgAlias: "local", ProjectAlias: "digital_twin_afdd", DefaultTimezone: "Asia/Singapore", ScriptTimeout: time.Second}
 	authSvc := auth.NewService(d, time.Hour)
 	// The hub is not started: gateways read as disconnected, so plant writes are
 	// validated and refused without touching any plant.
-	hub := datahub.New(d, nil, time.Second, os.TempDir(), "nlx.afdd_daikin")
+	hub := datahub.New(d, nil, time.Second, os.TempDir(), "local.digital_twin_afdd")
 	srv := New(Deps{Config: cfg, DB: d, Auth: authSvc, Hub: hub, DocsStore: docs})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

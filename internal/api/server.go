@@ -1,7 +1,6 @@
 // Package api implements the HTTP API consumed by the web UI.
 //
-// The UI was written against a NodeLinx style platform where business logic
-// lives in named scripts:
+// Business operations are exposed as named endpoints:
 //
 //	POST /api/js-service/exposed/execute/{org}/{project}/{category}/{script}
 //	     multipart form body, response {"data": ..., "error": ...}
@@ -206,7 +205,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle(storage.PublicPrefix, s.Store)
 	}
 	if s.cfg.StaticDir != "" {
-		mux.Handle("/", spaHandler(s.cfg.StaticDir, s.cfg.StaticMobileDir))
+		mux.Handle("/", spaHandler(s.cfg.StaticDir))
 	}
 	return s.recoverer(s.cors(mux))
 }
@@ -398,7 +397,7 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, httpx.Internal(err))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"nodelinx_exposed_session_id": token})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"session_id": token})
 }
 
 func (s *Server) serveLogout(w http.ResponseWriter, r *http.Request) {
