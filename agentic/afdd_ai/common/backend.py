@@ -17,7 +17,7 @@ from .config import get_settings
 
 log = logging.getLogger(__name__)
 
-SESSION_HEADER = "Nodelinx-Exposed-Session-Id"
+SESSION_HEADER = "X-AFDD-Session-Id"
 ORIGIN_HEADER = "X-AFDD-Origin"
 
 

@@ -287,7 +287,7 @@ class FakeBackend:
     def app(self) -> Starlette:
         async def execute(request: Request) -> JSONResponse:
             script = request.path_params["script"].strip("/").lower()
-            token = request.headers.get("nodelinx-exposed-session-id", "")
+            token = request.headers.get("x-afdd-session-id", "")
             try:
                 body = await request.json()
             except (ValueError, json.JSONDecodeError):

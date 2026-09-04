@@ -111,8 +111,8 @@ def get_settings() -> Settings:
             "AGENT_SESSION_DB_URL", db.replace("postgresql://", "postgresql+asyncpg://", 1).replace("postgres://", "postgresql+asyncpg://", 1)
         ),
         api_url=_env("AFDD_API_URL", "https://backend:4500").rstrip("/"),
-        org_alias=_env("ORG_ALIAS", "nlx"),
-        project_alias=_env("PROJECT_ALIAS", "afdd_daikin"),
+        org_alias=_env("ORG_ALIAS", "local"),
+        project_alias=_env("PROJECT_ALIAS", "digital_twin_afdd"),
         api_verify_tls=_env_bool("AFDD_API_VERIFY_TLS", False),
         agent_secret=_env("AGENT_SHARED_SECRET", ""),
         agent_allowed_hosts=tuple(h.strip() for h in _env("AGENT_ALLOWED_HOSTS", "ai-agent,localhost,127.0.0.1").split(",") if h.strip()),
