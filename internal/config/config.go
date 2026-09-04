@@ -29,8 +29,7 @@ type Config struct {
 	CORSOrigins []string
 
 	// Optional hosting of the built web UI (single page app).
-	StaticDir       string
-	StaticMobileDir string
+	StaticDir string
 
 	// Database
 	DatabaseURL string
@@ -98,12 +97,11 @@ func Load() (*Config, error) {
 		HTTPTLS:           envBool("HTTP_TLS", true),
 		TLSCertFile:       env("TLS_CERT_FILE", ""),
 		TLSKeyFile:        env("TLS_KEY_FILE", ""),
-		OrgAlias:          env("ORG_ALIAS", "nlx"),
-		ProjectAlias:      env("PROJECT_ALIAS", "afdd_daikin"),
+		OrgAlias:          env("ORG_ALIAS", "local"),
+		ProjectAlias:      env("PROJECT_ALIAS", "digital_twin_afdd"),
 		StrictProjectPath: envBool("STRICT_PROJECT_PATH", false),
 		CORSOrigins:       splitList(env("CORS_ORIGINS", "")),
 		StaticDir:         env("STATIC_DIR", ""),
-		StaticMobileDir:   env("STATIC_MOBILE_DIR", ""),
 
 		DatabaseURL: env("DATABASE_URL", "postgres://afdd:afdd@localhost:5432/afdd?sslmode=disable"),
 
@@ -126,9 +124,9 @@ func Load() (*Config, error) {
 		MQTTPublicPort:     env("MQTT_PUBLIC_PORT", ""),
 		MQTTWSAddr:         env("MQTT_WS_ADDR", ":9002"),
 		MQTTWSTLS:          envBool("MQTT_WS_TLS", true),
-		MQTTClientUsername: env("MQTT_CLIENT_USERNAME", "indie_nodelinx"),
+		MQTTClientUsername: env("MQTT_CLIENT_USERNAME", "afdd_ui"),
 		MQTTClientPassword: env("MQTT_CLIENT_PASSWORD", "indie123"),
-		NotificationTopic:  env("MQTT_NOTIFICATION_TOPIC", "EPM_NOTIFICATION"),
+		NotificationTopic:  env("MQTT_NOTIFICATION_TOPIC", "AFDD_NOTIFICATION"),
 
 		SessionTTL: envDuration("SESSION_TTL", 7*24*time.Hour),
 
