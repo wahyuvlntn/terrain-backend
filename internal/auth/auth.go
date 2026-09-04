@@ -19,7 +19,7 @@ import (
 )
 
 // SessionHeader carries the session token on every request.
-const SessionHeader = "Nodelinx-Exposed-Session-Id"
+const SessionHeader = "X-AFDD-Session-Id"
 
 // Roles.
 const (
