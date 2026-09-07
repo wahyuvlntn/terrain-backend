@@ -48,8 +48,8 @@ import (
 const (
 	adminUser = "superuser"
 	adminPass = "Sup3r-Secret!"
-	scriptURL = "/api/js-service/exposed/execute/nlx/afdd_daikin/"
-	queryURL  = "/api/database-connection/exposed/execute/nlx/afdd_daikin/business/"
+	scriptURL = "/api/js-service/exposed/execute/local/digital_twin_afdd/"
+	queryURL  = "/api/database-connection/exposed/execute/local/digital_twin_afdd/business/"
 )
 
 // env is the shared test environment.
@@ -121,10 +121,10 @@ func run(m *testing.M, base string) (int, error) {
 		s3Endpoint = strings.TrimPrefix(s3.URL, "http://")
 	}
 
-	cfg := &config.Config{OrgAlias: "nlx", ProjectAlias: "afdd_daikin", DatabaseURL: dbURL, SessionTTL: time.Hour,
+	cfg := &config.Config{OrgAlias: "local", ProjectAlias: "digital_twin_afdd", DatabaseURL: dbURL, SessionTTL: time.Hour,
 		EvalInterval: time.Second, LogInterval: time.Second, OfflineTimeout: time.Hour, RetentionDays: 730,
 		DefaultTimezone: "Asia/Singapore", ScriptTimeout: 2 * time.Second, EarlyWarningCooldown: time.Hour,
-		NotificationTopic: "EPM_NOTIFICATION", DataDir: os.TempDir(), CORSOrigins: []string{"*"}}
+		NotificationTopic: "AFDD_NOTIFICATION", DataDir: os.TempDir(), CORSOrigins: []string{"*"}}
 
 	d, err := db.Open(ctx, dbURL)
 	if err != nil {
@@ -148,7 +148,7 @@ func run(m *testing.M, base string) (int, error) {
 		return 0, err
 	}
 	n := notify.New(d, nil, cfg.NotificationTopic)
-	hub := datahub.New(d, nil, cfg.ScriptTimeout, cfg.DataDir, "nlx.afdd_daikin")
+	hub := datahub.New(d, nil, cfg.ScriptTimeout, cfg.DataDir, "local.digital_twin_afdd")
 	if err := hub.Start(ctx); err != nil {
 		return 0, err
 	}
@@ -190,7 +190,7 @@ func (e *env) login(user, pass string) (string, error) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Token string `json:"nodelinx_exposed_session_id"`
+		Token string `json:"session_id"`
 		Error string `json:"error"`
 	}
 	raw, _ := io.ReadAll(resp.Body)

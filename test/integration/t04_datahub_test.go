@@ -87,12 +87,12 @@ func TestDataHubProtocols(t *testing.T) {
 	defer cancel()
 
 	// Embedded broker (as in production) for MQTT_SERVER data sources.
-	br := broker.New(broker.Options{TCPAddr: "127.0.0.1:21884", UIUsername: "ui", UIPassword: "ui-pass", NotificationTopic: "EPM_NOTIFICATION"})
+	br := broker.New(broker.Options{TCPAddr: "127.0.0.1:21884", UIUsername: "ui", UIPassword: "ui-pass", NotificationTopic: "AFDD_NOTIFICATION"})
 	if err := br.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer br.Close()
-	hub := datahub.New(E.db, br, 2*time.Second, t.TempDir(), "nlx.afdd_daikin")
+	hub := datahub.New(E.db, br, 2*time.Second, t.TempDir(), "local.digital_twin_afdd")
 	defer hub.Stop()
 
 	t.Run("mqtt server", func(t *testing.T) {
@@ -124,7 +124,7 @@ func TestDataHubProtocols(t *testing.T) {
 		dev.Publish(identity+"/boiler", 1, false, `{"temp": 81}`).Wait()
 		waitValue(t, hub, "dh_mqtt_srv", "boiler", "81")
 		// A device cannot publish into another data source.
-		dev.Publish("nlx.afdd_daikin.other", 1, false, `{"temp": 1}`).Wait()
+		dev.Publish("local.digital_twin_afdd.other", 1, false, `{"temp": 1}`).Wait()
 		// The UI account may only read notifications.
 		ui, err := connect("ui", "ui-pass")
 		if err != nil {
@@ -144,9 +144,9 @@ func TestDataHubProtocols(t *testing.T) {
 		}
 		defer ui2.Disconnect(100)
 		got := make(chan string, 1)
-		ui2.Subscribe("EPM_NOTIFICATION", 0, func(_ paho.Client, m paho.Message) { got <- string(m.Payload()) }).Wait()
+		ui2.Subscribe("AFDD_NOTIFICATION", 0, func(_ paho.Client, m paho.Message) { got <- string(m.Payload()) }).Wait()
 		time.Sleep(200 * time.Millisecond)
-		if err := br.Publish("EPM_NOTIFICATION", []byte(`[{"id":1}]`)); err != nil {
+		if err := br.Publish("AFDD_NOTIFICATION", []byte(`[{"id":1}]`)); err != nil {
 			t.Fatal(err)
 		}
 		select {
