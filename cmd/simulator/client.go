@@ -136,7 +136,7 @@ func (c *Client) post(ctx context.Context, token, script string, form map[string
 		return nil, err
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("Nodelinx-Exposed-Session-Id", token)
+	req.Header.Set("X-AFDD-Session-Id", token)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
