@@ -179,7 +179,7 @@ func SPCSpecMessage(parameter string, at time.Time) string {
 // LicenseExpiryMessage formats a license expiry notification.
 func LicenseExpiryMessage(product, licenseName string, hours int, base bool) string {
 	if base {
-		return fmt.Sprintf("Nodelinx %s Base License '%s' is going to expire in %d hour(s)", product, licenseName, hours)
+		return fmt.Sprintf("Digital Twin AFDD %s Base License '%s' is going to expire in %d hour(s)", product, licenseName, hours)
 	}
-	return fmt.Sprintf("Nodelinx %s Equipment License '%s' is going to expire in %d hour(s)", product, licenseName, hours)
+	return fmt.Sprintf("Digital Twin AFDD %s Equipment License '%s' is going to expire in %d hour(s)", product, licenseName, hours)
 }

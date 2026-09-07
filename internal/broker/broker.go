@@ -1,6 +1,6 @@
 // Package broker embeds an MQTT broker. It serves two purposes:
 //   - push notifications to the web UI (websocket listener, topic
-//     EPM_NOTIFICATION by default), and
+//     AFDD_NOTIFICATION by default), and
 //   - receive data from field devices for MQTT_SERVER gateways (TCP listener).
 package broker
 
