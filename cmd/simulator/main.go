@@ -12,7 +12,7 @@
 //	DATABASE_URL        PostgreSQL of the backend (required)
 //	API_URL             backend base URL                 (https://backend:4500)
 //	MQTT_URL            backend MQTT listener            (tcp://backend:1883)
-//	ORG_ALIAS, PROJECT_ALIAS                             (nlx, afdd_daikin)
+//	ORG_ALIAS, PROJECT_ALIAS                             (local, digital_twin_afdd)
 //	DEMO_PASSWORD       password of the demo users       (Demo@2026)
 //	HISTORY_DAYS        days of generated history        (60)
 //	SIM_INTERVAL        telemetry period                 (5s)
@@ -132,7 +132,7 @@ func run(ctx context.Context, cmd string) error {
 	if err := waitFor(ctx, api, db); err != nil {
 		return err
 	}
-	client := newClient(db, api, env("ORG_ALIAS", "nlx"), env("PROJECT_ALIAS", "afdd_daikin"))
+	client := newClient(db, api, env("ORG_ALIAS", "local"), env("PROJECT_ALIAS", "digital_twin_afdd"))
 	seed := uint64(time.Now().UnixNano())
 	if s := env("SIM_SEED", ""); s != "" {
 		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
@@ -229,7 +229,7 @@ func doRun(ctx context.Context, db *pgxpool.Pool, c *Client, loc *time.Location,
 		slog.Info("simulation state restored", "saved_at", st.SavedAt.Format(time.RFC3339))
 	}
 	opts := LiveOptions{
-		MQTTURL: env("MQTT_URL", "tcp://backend:1883"), Org: env("ORG_ALIAS", "nlx"), Prj: env("PROJECT_ALIAS", "afdd_daikin"),
+		MQTTURL: env("MQTT_URL", "tcp://backend:1883"), Org: env("ORG_ALIAS", "local"), Prj: env("PROJECT_ALIAS", "digital_twin_afdd"),
 		Interval: envDur("SIM_INTERVAL", 5*time.Second), FaultEvery: envDur("SIM_FAULT_EVERY", 45*time.Minute),
 		TripEvery: envDur("SIM_TRIP_EVERY", 4*time.Hour), OfflineEvry: envDur("SIM_OFFLINE_EVERY", 8*time.Hour),
 		MaxFaults: envInt("SIM_MAX_FAULTS", 4), RampMin: envFloat("SIM_RAMP_MIN", 20), RampMax: envFloat("SIM_RAMP_MAX", 60),
