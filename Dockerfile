@@ -10,6 +10,7 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/afdd ./cmd/server     && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/afdd-sim ./cmd/simulator
 
 FROM alpine:3.22
+LABEL org.opencontainers.image.title="Digital Twin AFDD API and Simulator"
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S afdd && adduser -S -G afdd afdd \
     && mkdir -p /data && chown afdd:afdd /data

@@ -1,5 +1,6 @@
-# AFDD AI services: one image, three services (docker-compose: ai-agent, ai-mcp, ai-analytics).
+# Digital Twin AFDD AI services: one image for agent, MCP, and analytics.
 FROM python:3.12-slim
+LABEL org.opencontainers.image.title="Digital Twin AFDD AI Services"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
