@@ -1,6 +1,5 @@
-# Complete stack: PostgreSQL, MinIO and the AFDD backend.
-# The web UI (frontend repository, Dockerfile.nlam + nginx.conf) proxies /api
-# and /public to the backend on port 4500.
+# Complete Digital Twin AFDD stack: frontend, PostgreSQL, MinIO and backend.
+# The single Vite frontend proxies API, files, and MQTT through nginx.
 #
 #   docker compose up -d --build
 #   docker compose logs backend   # shows the generated superuser password on first start
@@ -21,6 +20,8 @@
 
 # Settings shared by the three AI services (afdd_ai/common/config.py).
 x-ai-env: &ai-env
+  ORG_ALIAS: ${ORG_ALIAS:-local}
+  PROJECT_ALIAS: ${PROJECT_ALIAS:-digital_twin_afdd}
   DATABASE_URL: postgresql://afdd_ai:${AI_DB_PASSWORD:-afdd-ai-dev}@postgres:5432/afdd
   DATABASE_URL_RO: postgresql://afdd_ai_ro:${AI_DB_RO_PASSWORD:-afdd-ai-ro-dev}@postgres:5432/afdd
   AGENT_SESSION_DB_URL: postgresql+asyncpg://afdd_ai:${AI_DB_PASSWORD:-afdd-ai-dev}@postgres:5432/afdd
@@ -50,6 +51,26 @@ x-ai-env: &ai-env
   LOG_LEVEL: ${AI_LOG_LEVEL:-INFO}
 
 services:
+  frontend:
+    build:
+      context: ../chiller-digital-twin-frontend
+      args:
+        VITE_ORG: ${ORG_ALIAS:-local}
+        VITE_PRJ: ${PROJECT_ALIAS:-digital_twin_afdd}
+        VITE_MQTT_USERNAME: ${MQTT_CLIENT_USERNAME:-afdd_ui}
+        VITE_MQTT_PASSWORD: ${MQTT_CLIENT_PASSWORD:-indie123}
+        VITE_MQTT_NOTIFICATION_TOPIC: ${MQTT_NOTIFICATION_TOPIC:-AFDD_NOTIFICATION}
+    image: digital-twin-afdd-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_UPSTREAM: https://backend:4500
+      MQTT_UPSTREAM: https://backend:9002
+    ports:
+      - "${FRONTEND_PORT:-8082}:80"
+
   postgres:
     # postgres:16-alpine (same base as the existing data volume) + pgvector, see docker/postgres
     build:
@@ -96,6 +117,11 @@ services:
       minio:
         condition: service_started
     environment:
+      ORG_ALIAS: ${ORG_ALIAS:-local}
+      PROJECT_ALIAS: ${PROJECT_ALIAS:-digital_twin_afdd}
+      MQTT_CLIENT_USERNAME: ${MQTT_CLIENT_USERNAME:-afdd_ui}
+      MQTT_CLIENT_PASSWORD: ${MQTT_CLIENT_PASSWORD:-indie123}
+      MQTT_NOTIFICATION_TOPIC: ${MQTT_NOTIFICATION_TOPIC:-AFDD_NOTIFICATION}
       DATABASE_URL: postgres://afdd:${POSTGRES_PASSWORD:-afdd}@postgres:5432/afdd?sslmode=disable
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-afddminio}
@@ -141,6 +167,8 @@ services:
     healthcheck:
       disable: true
     environment:
+      ORG_ALIAS: ${ORG_ALIAS:-local}
+      PROJECT_ALIAS: ${PROJECT_ALIAS:-digital_twin_afdd}
       DATABASE_URL: postgres://afdd:${POSTGRES_PASSWORD:-afdd}@postgres:5432/afdd?sslmode=disable
       API_URL: https://backend:4500
       MQTT_URL: tcp://backend:1883

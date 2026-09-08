@@ -3,6 +3,7 @@
 # Never switch to a Debian-based image on the existing volume: collation differs.
 ARG PG_BASE=postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
 FROM ${PG_BASE}
+LABEL org.opencontainers.image.title="Digital Twin AFDD PostgreSQL"
 ARG PGVECTOR_VERSION=0.8.6
 RUN set -eux; \
     apk add --no-cache --virtual .vector-build build-base $DOCKER_PG_LLVM_DEPS; \
