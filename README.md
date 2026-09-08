@@ -1,8 +1,8 @@
-# AFDD Backend
+# Digital Twin AFDD Backend
 
-Backend for the Daikin **Advance Fault Detection & Diagnostic** (asset monitoring and digital
-maintenance) web application. It implements the complete API used by the frontend repository
-(`modules/`, `nlam/`, `mobile/`) — all 294 scripts and queries the UI calls — plus the data
+Backend for the standalone **Digital Twin AFDD** (automated fault detection and diagnostics,
+asset monitoring and digital maintenance) application. It implements the complete API used by the frontend repository
+(`src/`, `public/`) — all 294 scripts and queries the UI calls — plus the data
 acquisition, evaluation engine, early-warning diagnosis, maintenance workflow and background jobs.
 
 - **Go 1.26**, single static binary (`cmd/server`)
@@ -14,7 +14,7 @@ acquisition, evaluation engine, early-warning diagnosis, maintenance workflow an
 
 ```bash
 cp .env.example .env          # adjust DATABASE_URL / MINIO_* if needed
-docker compose up -d --build  # postgres + minio + backend
+docker compose up -d --build  # frontend + postgres + minio + backend
 docker compose logs backend   # the first start prints the generated superuser password
 ```
 
@@ -25,15 +25,14 @@ go run ./cmd/server           # reads .env from the working directory
 ```
 
 The API listens on `https://<host>:4500` (self-signed certificate unless `TLS_CERT_FILE`/`TLS_KEY_FILE`
-are set). Point the frontend at it exactly like the original deployment: the frontend `nginx.conf`
-proxies `/api/` and `/public/` to port 4500. Alternatively set `STATIC_DIR` to the built `dist/nlam`
-folder (and `STATIC_MOBILE_DIR` to the mobile build) and the backend serves the UI itself. When the
-UI is built in dev mode (`VITE_DEV=true`) it calls the API host hard coded in
-`modules/utils/src/lib/request.ts`; set `CORS_ORIGINS` accordingly.
+are set). The frontend is available at `http://localhost:8082` in the complete Compose stack. Its nginx proxy
+forwards API, file, and MQTT traffic to this backend. Alternatively set `STATIC_DIR` to the frontend
+`dist/` directory to serve it from this process. Development uses the frontend Vite proxy; a direct
+`VITE_API_URL` needs matching `CORS_ORIGINS`.
 
-The web UI connects to `wss://<host>:9002/mqtt` with `VITE_MQTT_USERNAME`/`VITE_MQTT_PASSWORD`
-(defaults `indie_nodelinx` / `indie123`, configurable with `MQTT_CLIENT_USERNAME`/`MQTT_CLIENT_PASSWORD`).
-Browsers only accept that connection with a trusted certificate.
+The web UI connects through nginx `/mqtt` in Docker, or directly to `wss://<host>:9002/mqtt` with `VITE_MQTT_USERNAME`/`VITE_MQTT_PASSWORD`
+(defaults `afdd_ui` / `indie123`, configurable with `MQTT_CLIENT_USERNAME`/`MQTT_CLIENT_PASSWORD`).
+Direct browser connections require a trusted certificate.
 
 ### CLI
 
@@ -78,9 +77,9 @@ internal/script       sandboxed JavaScript (goja) with timeouts
 |---|---|---|
 | `jsRequest({url:'/module/script'})` | `POST /api/js-service/exposed/execute/{org}/{project}/module/script` (multipart) | `{"data": ..., "error": null}` or `{"data": null, "error": "<message>"}` with 4xx/5xx |
 | `dbRequest({url:'/filter/x'})` | `POST /api/database-connection/exposed/execute/{org}/{project}/{db}/filter/x` | raw JSON array |
-| login | `POST /api/user-management/exposed/get-session-add-expiry` `{username,password}` | `{"nodelinx_exposed_session_id": "..."}` |
+| login | `POST /api/user-management/exposed/get-session-add-expiry` `{username,password}` | `{"session_id": "..."}` |
 
-Requests are authenticated with the `Nodelinx-Exposed-Session-Id` header. Error messages are i18n keys
+Requests are authenticated with the `X-AFDD-Session-Id` header. Error messages are i18n keys
 of the frontend (`err_...`) or `MSG:<key>:<param>...`, so the UI shows translated toasts. Timestamps are
 ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.sssZ`); the client time zone comes from `timezone_offset`.
 
@@ -249,3 +248,11 @@ cd agentic && python -m venv .venv && .venv/Scripts/pip install --isolated -r re
 
 No test calls Gemini (models are scripted); `AFDD_TEST_REAL_EMBEDDINGS=1` opts in to one tiny embedding
 test. Tests that write the live work queues skip themselves while the `ai-analytics` container runs.
+
+## Standalone upgrade
+
+Rebuild all application services together and sign in again. Login returns `session_id` and
+requests use `X-AFDD-Session-Id`. Defaults: `ORG_ALIAS=local`, `PROJECT_ALIAS=digital_twin_afdd`,
+`MQTT_CLIENT_USERNAME=afdd_ui`, `MQTT_NOTIFICATION_TOPIC=AFDD_NOTIFICATION`. Update existing
+device topics or set matching alias overrides in the backend, simulator, AI services, and frontend
+build. Data is retained; equipment manufacturers remain equipment metadata.
