@@ -37,7 +37,7 @@ asset type = `asset.types.name`. One site today: `SGF1` "Singapore Fab 1 campus"
 ## 1. Architecture
 
 ```
-                     browser (nlam)                      
+                     browser (web)
   floating AI assistant · AI Insights page · Simulation page · Digital twin (live + replay)
           │ /api/js-service/... (JSON)        │ /api/agent/* (SSE)   │ /api/ai/documents/{id}/file
           ▼                                   ▼                      ▼
@@ -344,7 +344,7 @@ asset is referenced, and for Rec `validation_job` summary `{id, status}`.
 
 ### 4.6 Agent proxy (raw mux route `/api/agent/`)
 
-Authenticate `Nodelinx-Exposed-Session-Id`; require `aiassistant.read`; reverse-proxy to `AGENT_URL`
+Authenticate `X-AFDD-Session-Id`; require `aiassistant.read`; reverse-proxy to `AGENT_URL`
 (default `http://ai-agent:8000`) stripping `/api/agent`, with headers `X-Agent-Secret`,
 `X-AFDD-User-Id`, `X-AFDD-Username`, `X-AFDD-User-Name`, `X-AFDD-Session` (the user's token), and
 `X-AFDD-Permissions` (CSV `group.alias`). `httputil.ReverseProxy{FlushInterval: -1}`; lift the write
@@ -649,19 +649,19 @@ cached 60 s) and `X-Agent-Secret`.
 * Permission enum (`auth.api.ts`) + `screen-access.hooks.ts`: add `aiassistant`, `aiinsights`, `simulation`
   (both files CRLF: patch with a script, no `biome --write`).
 * Layout slot `assistant?: ReactNode` rendered after `<Outlet/>` (layout.tsx is CRLF).
-* `modules/utils`: `streamRequest(url, body, onEvent, signal)` (fetch + SSE parser + 401 handling).
+* `src/shared/utils`: `streamRequest(url, body, onEvent, signal)` (fetch + SSE parser + 401 handling).
 * Deps: `react-markdown@9`, `remark-gfm@4`.
-* `nlam/src/pages/ai-assistant/`: floating button + resizable panel (z ≈ 1100), session list, streamed
+* `src/pages/ai-assistant/`: floating button + resizable panel (z ≈ 1100), session list, streamed
   markdown, tool chips, `ChartBlock` (validated option + theme colours), citation chips → PDF viewer
   (`/api/ai/documents/{id}/file` via fetch → blob URL), `SimulationCard` (Approve / Reject with the
   confirm rules; polls the job; on completion offers "Replay in digital twin" and sends a follow-up
   message so the agent summarises), context store (`useSyncExternalStore`) that pages update (twin:
   selected node / asset / replay job).
-* `nlam/src/pages/ai-insights/` (route `/ai-insights`, menu "AI Insights", `aiinsights`): overview strip,
+* `src/pages/ai-insights/` (route `/ai-insights`, menu "AI Insights", `aiinsights`): overview strip,
   Recommendations (current vs recommended, savings, twin validation badge, Apply / Dismiss, history),
   Faults (list, evidence, RAG instruction with sources), Anomalies (filters, table, mini trend), Documents
   (library, upload, status, reindex), Rules (thresholds, calibration; admin edit), Fault injection (admin).
-* `nlam/src/pages/simulation/` (route `/simulation`, menu "Simulation", `simulation`): jobs list, new
+* `src/pages/simulation/` (route `/simulation`, menu "Simulation", `simulation`): jobs list, new
   scenario form (start, duration, weather offsets, load scale, set-point actions, fault injections with
   documented intensities, variants), job detail (summary, variant comparison chart, events), Approve /
   Reject for PROPOSED, "Replay in digital twin".
@@ -680,9 +680,9 @@ cached 60 s) and `X-Agent-Secret`.
 | backend API | `internal/api/simulation.go`, `ai_insights.go`, `ai_documents.go`, `digital_twin_faults.go`, `agent_proxy.go`, `routes.go`, `server.go` (RequireHuman), `internal/engine/*` (external alarms), `internal/storage` (docs store) |
 | analytics | `agentic/afdd_ai/analytics/*`, `agentic/afdd_ai/rag/*`, `agentic/tests/analytics/*` |
 | agent | `agentic/afdd_ai/agent/*`, `agentic/afdd_ai/mcp/*`, `agentic/tests/agent/*` |
-| frontend core | `modules/**` changes, `nlam/src/app.tsx`, `nlam/src/pages/ai-assistant/**`, `package.json` |
-| frontend insights | `nlam/src/pages/ai-insights/**` |
-| frontend simulation | `nlam/src/pages/simulation/**`, `nlam/src/pages/digital-twin/**` (replay) |
+| frontend core | `src/shared/**` changes, `src/app.tsx`, `src/pages/ai-assistant/**`, `package.json` |
+| frontend insights | `src/pages/ai-insights/**` |
+| frontend simulation | `src/pages/simulation/**`, `src/pages/digital-twin/**` (replay) |
 
 Shared, written before the fan-out: this document, `0005_agentic.sql`, `agentic/afdd_ai/common/*`,
 `agentic/requirements.txt`, `agentic/Dockerfile`.
