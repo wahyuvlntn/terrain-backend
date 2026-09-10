@@ -1,5 +1,6 @@
-// Package storage stores uploaded files in MinIO (or any S3 compatible
-// object store) and serves them under the /public/ URL prefix.
+// Package storage stores uploaded files in an object store - MinIO (or any
+// S3 compatible store) or Google Cloud Storage - and serves them under the
+// /public/ URL prefix.
 package storage
 
 import (
@@ -18,52 +19,81 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // PublicPrefix is the URL prefix under which stored objects are served.
 const PublicPrefix = "/public/"
 
-// Store is a thin wrapper around a MinIO bucket.
+// Store is a bucket of an object store.
 type Store struct {
-	client *minio.Client
+	b      backend
 	bucket string
+}
+
+// backend is an object store provider.
+type backend interface {
+	// ensure makes the bucket usable (MinIO creates it; GCS checks it).
+	ensure(ctx context.Context) error
+	ping(ctx context.Context) error
+	put(ctx context.Context, key, contentType string, r io.Reader, size int64) (int64, error)
+	// stat returns ErrNotFound for a missing object.
+	stat(ctx context.Context, key string) (objectInfo, error)
+	open(ctx context.Context, key string, info objectInfo) (io.ReadSeekCloser, error)
+	// remove ignores a missing object.
+	remove(ctx context.Context, key string) error
+}
+
+type objectInfo struct {
+	Size        int64
+	ContentType string
+	ModTime     time.Time
+	ETag        string
 }
 
 // Options configure the store.
 type Options struct {
-	Endpoint  string
+	Provider  string // "minio" (default) or "gcs"
+	Endpoint  string // MinIO endpoint; for GCS an emulator (STORAGE_EMULATOR_HOST), empty = Google
 	AccessKey string
 	SecretKey string
 	Bucket    string
 	UseSSL    bool
 	Region    string
+	// Wait is how long New retries an unready store (default 60 s).
+	Wait time.Duration
 }
 
-// New connects to MinIO and makes sure the bucket exists.
+// New opens the bucket, retrying while the store is not ready.
 func New(ctx context.Context, o Options) (*Store, error) {
-	client, err := minio.New(o.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(o.AccessKey, o.SecretKey, ""),
-		Secure: o.UseSSL,
-		Region: o.Region,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("minio client: %w", err)
+	var b backend
+	var err error
+	switch o.Provider {
+	case "gcs":
+		b = newGCS(o.Endpoint, o.Bucket)
+	case "", "minio":
+		if b, err = newMinio(o); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown storage provider %q", o.Provider)
 	}
-	s := &Store{client: client, bucket: o.Bucket}
-
-	deadline := time.Now().Add(60 * time.Second)
+	s := &Store{b: b, bucket: o.Bucket}
+	wait := o.Wait
+	if wait <= 0 {
+		wait = 60 * time.Second
+	}
+	deadline := time.Now().Add(wait)
 	for {
-		err = s.ensureBucket(ctx, o.Region)
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = b.ensure(cctx)
+		cancel()
 		if err == nil {
 			return s, nil
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("prepare bucket %q: %w", o.Bucket, err)
 		}
-		slog.Warn("object storage not ready, retrying", "err", err)
+		slog.Warn("object storage not ready, retrying", "bucket", o.Bucket, "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -72,23 +102,9 @@ func New(ctx context.Context, o Options) (*Store, error) {
 	}
 }
 
-func (s *Store) ensureBucket(ctx context.Context, region string) error {
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	exists, err := s.client.BucketExists(cctx, s.bucket)
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
-	return s.client.MakeBucket(cctx, s.bucket, minio.MakeBucketOptions{Region: region})
-}
-
 // Ping verifies connectivity.
 func (s *Store) Ping(ctx context.Context) error {
-	_, err := s.client.BucketExists(ctx, s.bucket)
-	return err
+	return s.b.ping(ctx)
 }
 
 // Saved describes a stored object.
@@ -156,14 +172,9 @@ func (s *Store) Save(ctx context.Context, folder, originalName, contentType stri
 	if size <= 0 {
 		size = -1
 	}
-	_, err := s.client.PutObject(ctx, s.bucket, key, r, size, minio.PutObjectOptions{ContentType: contentType})
+	size, err := s.b.put(ctx, key, contentType, r, size)
 	if err != nil {
 		return nil, fmt.Errorf("upload object: %w", err)
-	}
-	if size < 0 {
-		if st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{}); err == nil {
-			size = st.Size
-		}
 	}
 	return &Saved{Key: key, URL: PublicPrefix + key, Name: originalName, ContentType: contentType, Size: size}, nil
 }
@@ -211,14 +222,7 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	if key == "" {
 		return nil
 	}
-	err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
-	if err != nil {
-		var resp minio.ErrorResponse
-		if errors.As(err, &resp) && resp.Code == "NoSuchKey" {
-			return nil
-		}
-	}
-	return err
+	return s.b.remove(ctx, key)
 }
 
 // DeleteURL removes the object referenced by a public URL (best effort).
@@ -232,7 +236,7 @@ func (s *Store) DeleteURL(ctx context.Context, u string) {
 
 // Exists reports whether an object exists.
 func (s *Store) Exists(ctx context.Context, key string) bool {
-	_, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	_, err := s.b.stat(ctx, key)
 	return err == nil
 }
 
@@ -256,13 +260,9 @@ func (s *Store) Put(ctx context.Context, key, contentType string, r io.Reader, s
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	if _, err := s.client.PutObject(ctx, s.bucket, key, r, size, minio.PutObjectOptions{ContentType: contentType}); err != nil {
+	size, err := s.b.put(ctx, key, contentType, r, size)
+	if err != nil {
 		return nil, fmt.Errorf("upload object: %w", err)
-	}
-	if size < 0 {
-		if st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{}); err == nil {
-			size = st.Size
-		}
 	}
 	return &Saved{Key: key, Name: path.Base(key), ContentType: contentType, Size: size}, nil
 }
@@ -279,24 +279,23 @@ type Object struct {
 
 // Open opens an object for streaming; ErrNotFound when it does not exist.
 func (s *Store) Open(ctx context.Context, key string) (*Object, error) {
-	st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	st, err := s.b.stat(ctx, key)
 	if err != nil {
-		var resp minio.ErrorResponse
-		if errors.As(err, &resp) && (resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound) {
+		if errors.Is(err, ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("stat object: %w", err)
 	}
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	obj, err := s.b.open(ctx, key, st)
 	if err != nil {
 		return nil, fmt.Errorf("get object: %w", err)
 	}
-	return &Object{ReadSeekCloser: obj, Size: st.Size, ContentType: st.ContentType, ModTime: st.LastModified, ETag: st.ETag}, nil
+	return &Object{ReadSeekCloser: obj, Size: st.Size, ContentType: st.ContentType, ModTime: st.ModTime, ETag: st.ETag}, nil
 }
 
 // Read returns the full content of an object.
 func (s *Store) Read(ctx context.Context, key string) ([]byte, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	obj, err := s.Open(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -318,12 +317,12 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	st, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	st, err := s.b.stat(ctx, key)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	obj, err := s.b.open(ctx, key, st)
 	if err != nil {
 		http.Error(w, "unable to read object", http.StatusBadGateway)
 		return
@@ -337,5 +336,5 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if st.ETag != "" {
 		w.Header().Set("ETag", strconv.Quote(st.ETag))
 	}
-	http.ServeContent(w, r, path.Base(key), st.LastModified, obj)
+	http.ServeContent(w, r, path.Base(key), st.ModTime, obj)
 }
