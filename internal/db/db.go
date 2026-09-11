@@ -35,6 +35,15 @@ type Querier interface {
 // Open connects to PostgreSQL, retrying for a while so the service can start
 // before the database container is ready.
 func Open(ctx context.Context, url string) (*DB, error) {
+	return OpenWait(ctx, url, 60*time.Second)
+}
+
+// OpenWait connects to PostgreSQL, retrying for up to wait (a Cloud Run
+// instance's private network path to AlloyDB can take a while to come up).
+func OpenWait(ctx context.Context, url string, wait time.Duration) (*DB, error) {
+	if wait < 5*time.Second {
+		wait = 5 * time.Second
+	}
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
@@ -46,7 +55,7 @@ func Open(ctx context.Context, url string) (*DB, error) {
 	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 
 	var pool *pgxpool.Pool
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(wait)
 	for {
 		pool, err = pgxpool.NewWithConfig(ctx, cfg)
 		if err == nil {
