@@ -186,13 +186,16 @@ func (rt *runtime) setConnected(ok bool, err error) {
 // markAllBad flags every value as bad quality (connection lost).
 func (rt *runtime) markAllBad() {
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	var names []string
 	for k, v := range rt.byName {
 		if v.Q == QualityGood {
 			v.Q = QualityBad
 			rt.byName[k] = v
+			names = append(names, k)
 		}
 	}
+	rt.mu.Unlock()
+	rt.hub.markDirty(rt, names)
 }
 
 // update stores values keyed by tag name.
@@ -201,6 +204,7 @@ func (rt *runtime) update(values map[string]VTQC) {
 		return
 	}
 	recv := time.Now().UnixMilli()
+	names := make([]string, 0, len(values))
 	rt.mu.Lock()
 	for name, v := range values {
 		v.R = recv
@@ -211,15 +215,18 @@ func (rt *runtime) update(values map[string]VTQC) {
 			v.C = prev.C + 1
 		}
 		rt.byName[name] = v
+		names = append(names, name)
 	}
 	rt.mu.Unlock()
+	rt.hub.markDirty(rt, names)
 	rt.hub.notify(rt.gw.Alias)
 }
 
-// updateByAddress stores push values keyed by address and maps them to tags.
-func (rt *runtime) updateByAddress(values map[string]VTQC) {
+// updateByAddress stores push values keyed by address and maps them to tags;
+// it returns the names of the tags it updated.
+func (rt *runtime) updateByAddress(values map[string]VTQC) []string {
 	if len(values) == 0 {
-		return
+		return nil
 	}
 	byName := map[string]VTQC{}
 	rt.mu.Lock()
@@ -232,12 +239,15 @@ func (rt *runtime) updateByAddress(values map[string]VTQC) {
 	rt.keys = mergeKeys(rt.keys, keys)
 	tags := rt.gw.Tags
 	rt.mu.Unlock()
+	names := make([]string, 0, len(tags))
 	for _, t := range tags {
 		if v, ok := values[t.Address]; ok {
 			byName[t.Name] = v
+			names = append(names, t.Name)
 		}
 	}
 	rt.update(byName)
+	return names
 }
 
 func mergeKeys(a, b []string) []string {
@@ -272,11 +282,19 @@ type Hub struct {
 
 	subMu       sync.RWMutex
 	subscribers []func(alias string)
+
+	// shared state (shared.go)
+	mode         Mode
+	flushEvery   time.Duration
+	refreshEvery time.Duration
+	dirtyMu      sync.Mutex
+	dirty        map[string]map[string]struct{} // lower(alias) -> tag names to write
 }
 
 // New creates the hub.
 func New(d *db.DB, b *broker.Broker, scriptTimeout time.Duration, dataDir, mqttPrefix string) *Hub {
-	return &Hub{db: d, broker: b, scriptTimeout: scriptTimeout, dataDir: dataDir, mqttPrefix: mqttPrefix, gateways: map[string]*runtime{}}
+	return &Hub{db: d, broker: b, scriptTimeout: scriptTimeout, dataDir: dataDir, mqttPrefix: mqttPrefix, gateways: map[string]*runtime{},
+		dirty: map[string]map[string]struct{}{}, flushEvery: time.Second, refreshEvery: time.Second}
 }
 
 // MQTTIdentity returns the username/topic devices use for an MQTT_SERVER gateway.
@@ -303,8 +321,15 @@ func (h *Hub) notify(alias string) {
 	}
 }
 
-// Start loads every gateway and connects the active ones.
+// Start loads every gateway and connects the active ones (an API replica only
+// loads their configurations and reads the shared values).
 func (h *Hub) Start(ctx context.Context) error {
+	if h.mode == ModeReplica {
+		return h.startReplica(ctx)
+	}
+	if h.mode == ModeWorker {
+		go h.flushLoop(ctx)
+	}
 	aliases, err := db.Strings(ctx, h.db, `SELECT alias FROM dh.gateways ORDER BY id`)
 	if err != nil {
 		return err
@@ -392,6 +417,11 @@ func LoadGateway(ctx context.Context, q db.Querier, alias string) (*Gateway, err
 // Reload (re)starts a gateway from its stored configuration. Values of a
 // running gateway are kept when it is restarted.
 func (h *Hub) Reload(ctx context.Context, alias string) error {
+	if h.mode == ModeReplica {
+		err := h.replicaLoad(ctx, alias)
+		h.emit(ctx, alias)
+		return err
+	}
 	key := strings.ToLower(alias)
 	h.mu.Lock()
 	old := h.gateways[key]
@@ -456,6 +486,10 @@ func (h *Hub) Remove(alias string) {
 	rt := h.gateways[key]
 	delete(h.gateways, key)
 	h.mu.Unlock()
+	if h.mode == ModeReplica {
+		h.emit(context.Background(), alias)
+		return
+	}
 	if rt != nil {
 		h.stopRuntime(rt)
 	}
@@ -512,6 +546,24 @@ func (h *Hub) Read(ctx context.Context, alias string, addresses []string) (map[s
 	if rt == nil {
 		return nil, httpx.BadRequest("err_invalid_gateway_alias")
 	}
+	if h.mode == ModeReplica {
+		if !isPush(rt.gw.Type) {
+			return nil, errOnWorker
+		}
+		res := map[string]string{}
+		rt.mu.RLock()
+		for _, t := range rt.gw.Tags {
+			if v, ok := rt.byName[t.Name]; ok {
+				res[t.Address] = v.V
+			}
+		}
+		rt.mu.RUnlock()
+		out := map[string]string{}
+		for _, a := range addresses {
+			out[a] = res[a]
+		}
+		return out, nil
+	}
 	if rt.drv == nil {
 		return nil, httpx.BadRequest("err_invalid_data_source_type")
 	}
@@ -533,6 +585,18 @@ func (h *Hub) Browse(ctx context.Context, alias, nodeID string, depth int) ([]*T
 	rt := h.runtime(alias)
 	if rt == nil {
 		return nil, httpx.BadRequest("err_invalid_gateway_alias")
+	}
+	if h.mode == ModeReplica {
+		if !isPush(rt.gw.Type) {
+			return nil, errOnWorker
+		}
+		rt.mu.RLock()
+		defer rt.mu.RUnlock()
+		nodes := []*TagNode{}
+		for _, t := range rt.gw.Tags {
+			nodes = append(nodes, &TagNode{Address: t.Address, Name: t.Address})
+		}
+		return nodes, nil
 	}
 	if rt.drv == nil {
 		return nil, httpx.BadRequest("err_data_source_no_browse")
@@ -602,8 +666,19 @@ func (h *Hub) IngestREST(ctx context.Context, alias, apiKey string, body io.Read
 		return 0, httpx.BadRequest(err.Error())
 	}
 	rt.setConnected(true, nil)
-	rt.updateByAddress(values)
+	names := rt.updateByAddress(values)
+	if h.mode == ModeReplica {
+		// durable before the device gets its answer: the worker evaluates it
+		if err := h.persistPush(ctx, rt, names); err != nil {
+			return 0, err
+		}
+	}
 	return len(values), nil
+}
+
+// isPush reports whether devices push to the gateway (its values are cached).
+func isPush(protocol string) bool {
+	return protocol == RESTServer || protocol == MQTTServer
 }
 
 // errUnsupported is returned by drivers for unsupported operations.

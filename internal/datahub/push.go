@@ -190,7 +190,18 @@ type restServerDriver struct{}
 
 func (d *restServerDriver) run(ctx context.Context, rt *runtime) {
 	rt.setConnected(true, nil)
-	<-ctx.Done()
+	if rt.hub.mode != ModeWorker {
+		<-ctx.Done()
+		return
+	}
+	// worker: the API replicas receive the pushes and write them to the
+	// shared state; read them back from there
+	var since int64
+	pollLoop(ctx, rt.hub.refreshEvery, func(ctx context.Context) error {
+		var err error
+		since, err = rt.hub.pullShared(ctx, rt, since)
+		return err
+	}, func(err error) { slog.Warn("read REST push values", "alias", rt.gw.Alias, "err", err) })
 }
 
 func (d *restServerDriver) read(_ context.Context, rt *runtime, addresses []string) (map[string]string, error) {
