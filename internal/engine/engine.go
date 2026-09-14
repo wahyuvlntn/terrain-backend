@@ -57,6 +57,10 @@ type Engine struct {
 	// External FDD alarms (analytics.faults), see external.go.
 	extMu sync.Mutex
 	ext   externalState
+
+	// OnInvalidate, when set, is told about every invalidation (an API
+	// replica signals the processing worker that runs the evaluation).
+	OnInvalidate func()
 }
 
 type openEvent struct {
@@ -111,6 +115,9 @@ func (e *Engine) Invalidate() {
 	select {
 	case e.reload <- struct{}{}:
 	default:
+	}
+	if e.OnInvalidate != nil {
+		e.OnInvalidate()
 	}
 }
 
