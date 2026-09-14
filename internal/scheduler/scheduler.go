@@ -29,6 +29,10 @@ type Deps struct {
 	RefreshKPIs   func(ctx context.Context) error
 	RetentionDays int
 	ProductName   string
+	// NoPartitionJobs leaves partition creation and retention (DDL) to a
+	// privileged maintenance job (the cloud deployment's runtime identity
+	// cannot create or drop partitions).
+	NoPartitionJobs bool
 }
 
 // Job is a named periodic task.
@@ -62,8 +66,11 @@ func New(d Deps) *Scheduler {
 		{Name: "kpi-refresh", Interval: 15 * time.Minute, Delay: 90 * time.Second, Run: d.RefreshKPIs},
 		// Also run once at start-up (MaintainPartitions) before the engine logs
 		// values; the first scheduled run retries soon in case that one failed.
-		{Name: PartitionMaintenanceJob, Interval: 24 * time.Hour, Delay: 10 * time.Minute, Run: s.MaintainPartitions},
-		{Name: "retention", Interval: 24 * time.Hour, Delay: 5 * time.Minute, Run: s.retention},
+	}
+	if !d.NoPartitionJobs {
+		s.jobs = append(s.jobs,
+			Job{Name: PartitionMaintenanceJob, Interval: 24 * time.Hour, Delay: 10 * time.Minute, Run: s.MaintainPartitions},
+			Job{Name: "retention", Interval: 24 * time.Hour, Delay: 5 * time.Minute, Run: s.retention})
 	}
 	return s
 }
