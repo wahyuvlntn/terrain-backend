@@ -30,6 +30,9 @@ type Plant struct {
 	defs    map[string]map[string]*engine.ParamDef // model -> alias -> thresholds
 	sys     *Asset                                 // the plant controller (CHWS_01)
 	groups  map[string][]*Asset
+	// fab is the production model of the FAB1 L2 module (nil in the clones
+	// of simulation jobs: their process tools stay idle)
+	fab *Fab
 }
 
 func newPlant(seed uint64, loc *time.Location) *Plant {
@@ -71,8 +74,13 @@ func newPlant(seed uint64, loc *time.Location) *Plant {
 		idx[e.Group]++
 		p.addAsset(a)
 	}
+	p.linkSupport()
+	if len(p.group("tool")) > 0 {
+		p.fab = newFab(p, rand.New(rand.NewPCG(r.Uint64(), r.Uint64())))
+	}
 	return p
 }
+
 
 // addAsset registers an asset (in equipment order).
 func (p *Plant) addAsset(a *Asset) {
@@ -165,10 +173,16 @@ func (p *Plant) updateDuty(t time.Time) {
 			a.Duty = i < len(chillers) && chillers[i].Duty && !a.Trip && !a.Maint
 		}
 	}
-	for _, g := range []string{"cda", "mau", "vac", "system"} {
+	for _, g := range []string{"cda", "mau", "vac", "scrub", "pch", "system"} {
 		for _, a := range p.group(g) {
 			a.Duty = true
 		}
+	}
+	// A process tool is available while its dry pump, scrubber and process
+	// chiller run; one that is down interlocks it (scheduled when it is in
+	// planned maintenance).
+	for _, a := range p.group("tool") {
+		a.Duty, a.Interlock = true, supportInterlock(a)
 	}
 }
 
@@ -198,6 +212,9 @@ func (p *Plant) Step(t time.Time, dt float64) map[*Asset]map[string]float64 {
 	env.ChillerLoad = clamp(env.FabLoad/(float64(max(nCh, 1))*chillerCapKW), 0.2, 1)
 	p.supervise(t, &env, dt)
 	p.Env = env
+	if p.fab != nil {
+		p.fab.step(t, dt)
+	}
 	truth := make(map[*Asset]map[string]float64, len(p.Assets))
 	for _, a := range p.Assets {
 		truth[a] = a.Values(t, env, dt)
