@@ -11,7 +11,9 @@ import (
 // simulator models the facility systems the fab depends on - the central
 // utility building (chillers, cooling towers, process cooling water pumps,
 // clean dry air compressors) and the fab itself (cleanroom make-up air units
-// and sub-fab dry vacuum pumps).
+// and the sub-fab support units) - and the wafer production of FAB1: 31
+// process tools of a 40 nm logic line and the lots they run (fabplant.go,
+// tools.go, fabroute.go, fab.go).
 // ---------------------------------------------------------------------------
 
 // Threshold is an equipment parameter limit ("X > _" or "X < _").
@@ -344,17 +346,17 @@ func statusParams() []ParamSpec {
 // ---------------------------------------------------------------------------
 // Master data
 
-var equipmentTypes = []string{"Centrifugal Chiller", "Cooling Tower", "Process Cooling Water Pump", "Chilled Water Pump", "Condenser Water Pump",
-	"Air Compressor", "Make-up Air Unit", "Dry Vacuum Pump", "Chilled Water System"}
-var brands = []string{"Daikin", "Baltimore Aircoil", "Grundfos", "Atlas Copco", "Edwards"}
-var series = []string{"WSC Centrifugal", "Vision AHU", "Series 3000", "NBG", "NKG", "ZR VSD+", "iXH", "Plant Controls"}
+var equipmentTypes = append([]string{"Centrifugal Chiller", "Cooling Tower", "Process Cooling Water Pump", "Chilled Water Pump", "Condenser Water Pump",
+	"Air Compressor", "Make-up Air Unit", "Dry Vacuum Pump", "Chilled Water System"}, fabEquipmentTypes...)
+var brands = []string{"Daikin", "Baltimore Aircoil", "Grundfos", "Atlas Copco", "Edwards", "Tool OEM", "Utility OEM"}
+var series = append([]string{"WSC Centrifugal", "Vision AHU", "Series 3000", "NBG", "NKG", "ZR VSD+", "iXH", "Plant Controls"}, fabSeries...)
 
 type issueCategory struct {
 	Name   string
 	Issues [][2]string // code, name
 }
 
-var issueCategories = []issueCategory{
+var issueCategories = append([]issueCategory{
 	{"Refrigeration", [][2]string{{"REF-01", "High Refrigerant Pressure"}, {"REF-02", "Low Pressure / Refrigerant Charge"}, {"REF-03", "Oil System"}}},
 	{"Mechanical", [][2]string{{"MEC-01", "Vibration"}, {"MEC-02", "Bearing"}, {"MEC-03", "Belt / Drive Train"}, {"MEC-04", "Seal Leak"}}},
 	{"Thermal", [][2]string{{"THR-01", "Temperature Deviation"}, {"THR-02", "Heat Transfer"}}},
@@ -363,7 +365,7 @@ var issueCategories = []issueCategory{
 	{"Electrical", [][2]string{{"ELE-01", "Motor Overcurrent"}}},
 	{"Process Utilities", [][2]string{{"PRC-01", "By-product Deposition"}, {"PRC-02", "Purge Gas"}, {"PRC-03", "Vacuum Performance"}, {"PRC-04", "Compressed Air Quality"}}},
 	{"Sensors & Controls", [][2]string{{"SEN-01", "Sensor Bias / Calibration"}, {"CTL-01", "Control Loop Tuning"}, {"VLV-01", "Valve Leakage / Stuck"}}},
-}
+}, fabIssueCategories...)
 
 // fddCodes are the alarm codes of the LBNL fault detection rules (analytics
 // rule code = alarm code); the engine raises them as external alarms.
@@ -372,7 +374,7 @@ var fddCodes = []string{"CHL-011", "CT-013", "CT-014", "CHS-005", "CHS-006", "CH
 func isFDDCode(code string) bool { return contains(fddCodes, code) }
 
 // alarmCodes lists every alarm code (master data, "CODE - Name").
-var alarmCodes = [][2]string{
+var alarmCodes = append([][2]string{
 	{"CHL-001", "High Condenser Pressure"},
 	{"CHL-002", "Low Evaporator Pressure"},
 	{"CHL-003", "High Compressor Discharge Temperature"},
@@ -444,7 +446,7 @@ var alarmCodes = [][2]string{
 	{"GEN-001", "Mechanical Seal Leak"},
 	{"GEN-002", "Abnormal Noise"},
 	{"GEN-003", "Damaged Insulation / Panel"},
-}
+}, fabAlarmCodes...)
 
 func codeName(code string) string {
 	for _, c := range alarmCodes {
@@ -920,13 +922,15 @@ func chwSystemModel() *ModelSpec {
 // models returns every model; base models come before their extensions.
 
 func models() []*ModelSpec {
-	return []*ModelSpec{
+	out := []*ModelSpec{
 		chillerModel(), coolingTowerModel(), pcwPumpModel(), chwPumpModel(), cwPumpModel(), compressorModel(), mauModel(), chwSystemModel(),
 		dryPumpBase(),
 		dryPumpModel("Edwards iXH1220H Dry Pump (Etch)", "iXH1220H for etch process chambers (corrosive and condensable chemistries)", nil),
 		dryPumpModel("Edwards iXH610 Dry Pump (CVD)", "iXH610 for CVD process chambers; runs hotter to avoid condensation",
 			map[string]CondSpec{"VAC-002": gt("body_temp", 115, false)}),
 	}
+	out = append(out, subFabModels()...)
+	return append(out, processToolModels()...)
 }
 
 // ---------------------------------------------------------------------------
@@ -941,8 +945,14 @@ type LocSpec struct {
 var locations = []LocSpec{
 	{"FAB1 Wafer Fab", "", "fab", 95, 90},
 	{"FAB1 L1 Sub-Fab", "FAB1 Wafer Fab", "floor", 95, 90},
-	{"Sub-Fab Bay A (Etch)", "FAB1 L1 Sub-Fab", "room", 95, 90},
-	{"Sub-Fab Bay B (CVD)", "FAB1 L1 Sub-Fab", "room", 95, 90},
+	{locSubNorth, "FAB1 L1 Sub-Fab", "room", 95, 90},
+	{locSubSouth, "FAB1 L1 Sub-Fab", "room", 95, 90},
+	{locCleanroom, "FAB1 Wafer Fab", "floor", 90, 85},
+	{locPhoto, locCleanroom, "room", 90, 85},
+	{locEtchFilm, locCleanroom, "room", 90, 85},
+	{locImpCMP, locCleanroom, "room", 90, 85},
+	{locDiff, locCleanroom, "room", 90, 85},
+	{locWetMet, locCleanroom, "room", 90, 85},
 	{"FAB1 L4 Mechanical Deck", "FAB1 Wafer Fab", "floor", 97, 90},
 	{"MAU Plant Room North", "FAB1 L4 Mechanical Deck", "room", 97, 90},
 	{"MAU Plant Room South", "FAB1 L4 Mechanical Deck", "room", 97, 90},
@@ -980,6 +990,7 @@ var gateways = []GatewaySpec{
 	{"cub_bms", "CUB Building Management System", "MQTT bridge of the central utility building BMS (chillers, towers, PCW pumps, CDA)"},
 	{"fab1_hvac", "FAB1 HVAC Controller", "MQTT bridge of the FAB1 cleanroom HVAC controllers (make-up air units)"},
 	{"fab1_subfab", "FAB1 Sub-Fab Monitoring", "Sub-fab equipment monitoring gateway (dry vacuum pumps)"},
+	{"fab1_tools", "FAB1 Tool Automation Host", "Equipment automation host of the FAB1 L2 process tools (SECS/GEM to MQTT)"},
 }
 
 // EquipSpec is one piece of equipment.
@@ -1041,16 +1052,10 @@ func equipment() []*EquipSpec {
 			Critical:   [][2]string{{"Cleanroom pressurisation", "Fresh air make-up for FAB1 cleanroom (ISO class 5)"}},
 			Supporting: [][2]string{{"Humidity control", "Dehumidifies outdoor air to 45 % RH supply"}}})
 	}
-	for i := 1; i <= 6; i++ {
-		model, room, tool := "Edwards iXH1220H Dry Pump (Etch)", "Sub-Fab Bay A (Etch)", fmt.Sprintf("Etch chamber ETCH-0%d", i)
-		if i > 3 {
-			model, room, tool = "Edwards iXH610 Dry Pump (CVD)", "Sub-Fab Bay B (CVD)", fmt.Sprintf("CVD chamber CVD-0%d", i-3)
-		}
-		add(&EquipSpec{Alias: fmt.Sprintf("DP_%02d", i), Name: fmt.Sprintf("Dry Pump DP-%02d", i), Model: model, Location: room,
-			Gateway: "fab1_subfab", Installed: fmt.Sprintf("2022-0%d-18", i), Group: "vac",
-			Critical:   [][2]string{{"Process vacuum", tool + " foreline vacuum"}},
-			Supporting: [][2]string{{"Abatement", "Exhaust routed to burn-wet scrubber"}}})
-	}
+	// FAB1 sub-fab support units and L2 process tools (after the facility
+	// equipment, so the facility units keep their random streams)
+	out = append(out, subFabEquipment()...)
+	out = append(out, toolEquipment()...)
 	return out
 }
 
@@ -1097,6 +1102,7 @@ var userGroups = func() []GroupSpec {
 		"aiassistant": {"read"},
 		"aiinsights":  {"read", "update"},
 		"simulation":  {"read", "create"},
+		"production":  {"read"},
 	} {
 		mgmt[g] = append(mgmt[g], extra...)
 	}
@@ -1107,6 +1113,7 @@ var userGroups = func() []GroupSpec {
 	tech["aiassistant"] = []string{"read"}
 	tech["aiinsights"] = []string{"read"}
 	tech["simulation"] = []string{"read"}
+	tech["production"] = []string{"read"}
 	ops := readAll("locationoverview", "equipmentoverview", "alarmsreport", "maintenanceorder", "earlywarningdiagnostics", "earlywarningdashboard", "maintenanceinstruction")
 	ops["maintenanceorder"] = append(ops["maintenanceorder"], "create")
 	// control room operators run the plant: they may write set points and
@@ -1115,17 +1122,18 @@ var userGroups = func() []GroupSpec {
 	ops["aiassistant"] = []string{"read"}
 	ops["aiinsights"] = []string{"read"}
 	ops["simulation"] = []string{"read", "create"}
+	ops["production"] = []string{"read"}
 	all := []string{"FAB1 Wafer Fab", "CUB Central Utility Building"}
 	return []GroupSpec{
 		{"facility_management", "Facility Management", "Facility managers, supervisors and reliability engineers", all, mgmt},
 		{"cub_maintenance", "CUB Maintenance Team", "Technicians of the central utility building", []string{"CUB Central Utility Building"}, tech},
-		{"fab_facilities", "FAB1 Facilities Team", "Technicians for cleanroom HVAC and sub-fab vacuum", []string{"FAB1 Wafer Fab"}, tech},
+		{"fab_facilities", "FAB1 Facilities Team", "Technicians for cleanroom HVAC, sub-fab vacuum and process equipment", []string{"FAB1 Wafer Fab"}, tech},
 		{"control_room", "Facility Control Room", "24/7 facility monitoring operators", all, ops},
 	}
 }()
 
 var cubTypes = []string{"Centrifugal Chiller", "Cooling Tower", "Process Cooling Water Pump", "Chilled Water Pump", "Condenser Water Pump", "Air Compressor", "Chilled Water System"}
-var fabTypes = []string{"Make-up Air Unit", "Dry Vacuum Pump"}
+var fabTypes = append([]string{"Make-up Air Unit", "Dry Vacuum Pump"}, fabEquipmentTypes...)
 
 var users = []UserSpec{
 	{"sarah_lim", "Sarah Lim", "sarah.lim@sgfab.example", "FM-0001", "facility_management", "admin", nil, nil},
@@ -1138,8 +1146,13 @@ var users = []UserSpec{
 	{"chen_jiahui", "Chen Jia Hui", "chen.jiahui@sgfab.example", "MT-0121", "cub_maintenance", "technician", []string{"CUB Central Utility Building"}, []string{"Air Compressor", "Process Cooling Water Pump", "Chilled Water Pump"}},
 	{"hafiz_rahman", "Muhammad Hafiz", "hafiz.rahman@sgfab.example", "MT-0204", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Make-up Air Unit"}},
 	{"tan_meiling", "Tan Mei Ling", "tan.meiling@sgfab.example", "MT-0209", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Make-up Air Unit", "Dry Vacuum Pump"}},
-	{"daniel_wong", "Daniel Wong", "daniel.wong@sgfab.example", "MT-0215", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Dry Vacuum Pump"}},
-	{"priya_nair", "Priya Nair", "priya.nair@sgfab.example", "MT-0222", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Dry Vacuum Pump", "Make-up Air Unit"}},
+	{"daniel_wong", "Daniel Wong", "daniel.wong@sgfab.example", "MT-0215", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Dry Vacuum Pump", "Exhaust Abatement System", "Process Chiller"}},
+	{"priya_nair", "Priya Nair", "priya.nair@sgfab.example", "MT-0222", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Dry Vacuum Pump", "Make-up Air Unit", "Exhaust Abatement System"}},
+	{"aaron_lee", "Aaron Lee", "aaron.lee@sgfab.example", "MT-0230", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Plasma Etch Tool", "CVD Tool", "PVD Tool"}},
+	{"nadia_hassan", "Nadia Hassan", "nadia.hassan@sgfab.example", "MT-0236", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Metrology Tool", "Inspection Tool", "Parametric Test System", "Wet Clean Station"}},
+	{"wei_jie", "Wei Jie Tan", "weijie.tan@sgfab.example", "MT-0241", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Lithography Scanner", "Litho Track"}},
+	{"rahim_osman", "Rahim Osman", "rahim.osman@sgfab.example", "MT-0247", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"Ion Implanter", "Diffusion Furnace", "RTP Tool", "Asher"}},
+	{"grace_tan", "Grace Tan", "grace.tan@sgfab.example", "MT-0252", "fab_facilities", "technician", []string{"FAB1 Wafer Fab"}, []string{"CMP Tool", "Electroplating Tool", "Wet Clean Station"}},
 	{"jason_teo", "Jason Teo", "jason.teo@sgfab.example", "CR-0301", "control_room", "operator", nil, nil},
 	{"siti_rahmah", "Siti Rahmah", "siti.rahmah@sgfab.example", "CR-0305", "control_room", "operator", nil, nil},
 }
