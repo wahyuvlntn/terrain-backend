@@ -13,7 +13,8 @@ import (
 // random sources are new ones derived from seed, so clones made with the
 // same seed evolve identically until their actions differ. Model and
 // equipment definitions are read-only and shared; EnvHook is a setting of
-// the job using the clone and is not copied.
+// the job using the clone and is not copied. The production model is cloned
+// too (production planning jobs); facility scenarios drop it (dropFab).
 func (p *Plant) Clone(seed uint64) *Plant {
 	r := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 	c := &Plant{ByAlias: make(map[string]*Asset, len(p.Assets)), Models: p.Models, Env: p.Env, loc: p.loc, anchor: p.anchor, rng: r,
@@ -24,6 +25,16 @@ func (p *Plant) Clone(seed uint64) *Plant {
 		na := a.clone(rand.New(rand.NewPCG(r.Uint64(), r.Uint64())))
 		byOld[a] = na
 		c.addAsset(na)
+	}
+	for old, na := range byOld {
+		na.vacPump, na.abate, na.coolant = byOld[old.vacPump], byOld[old.abate], byOld[old.coolant]
+		na.served = nil
+		for _, s := range old.served {
+			na.served = append(na.served, byOld[s])
+		}
+	}
+	if p.fab != nil {
+		c.fab = p.fab.cloneTo(c, r.Uint64())
 	}
 	if p.Truth != nil {
 		c.Truth = make(map[*Asset]map[string]float64, len(p.Truth))
@@ -43,6 +54,7 @@ func (p *Plant) Clone(seed uint64) *Plant {
 func (a *Asset) clone(r *rand.Rand) *Asset {
 	na := *a
 	na.rng = r
+	na.tool, na.cell, na.vacPump, na.abate, na.coolant, na.served, na.Coupled, na.ProcLoad = nil, nil, nil, nil, nil, nil, false, 0
 	if a.TripSpec != nil {
 		ts := *a.TripSpec
 		na.TripSpec = &ts
