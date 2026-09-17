@@ -20,6 +20,8 @@ import (
 type SimState struct {
 	SavedAt time.Time             `json:"saved_at"`
 	Assets  map[string]AssetState `json:"assets"`
+	// Fab is the production state (work in progress, tools, counters).
+	Fab *Fab `json:"fab,omitempty"`
 }
 
 type AssetState struct {
@@ -34,7 +36,7 @@ type AssetState struct {
 const stateKey = "demo_simulator_state"
 
 func captureState(p *Plant) SimState {
-	st := SimState{SavedAt: time.Now().UTC(), Assets: map[string]AssetState{}}
+	st := SimState{SavedAt: time.Now().UTC(), Assets: map[string]AssetState{}, Fab: p.fab}
 	for _, a := range p.Assets {
 		as := AssetState{FilterDays: a.FilterDays, Trip: a.Trip, TripUntil: a.TripUntil}
 		if len(a.Ctl) > 0 {
@@ -79,6 +81,9 @@ func restoreState(p *Plant, st SimState) {
 			}
 		}
 	}
+	if p.fab != nil {
+		p.fab.restore(st.Fab)
+	}
 }
 
 // Command is an operator write received on a gateway's command topic
@@ -108,6 +113,7 @@ type snapshotReq struct {
 // LiveOptions configure the live simulation.
 type LiveOptions struct {
 	MQTTURL     string
+	HTTP        *httpTransport // SIM_TRANSPORT=http: push / poll over HTTPS instead of MQTT
 	Org, Prj    string
 	Interval    time.Duration
 	FaultEvery  time.Duration
@@ -135,6 +141,8 @@ type Live struct {
 	trips   chan *Asset      // tripped assets for the operator bot
 	cmds    chan Command     // operator writes, applied on the simulation loop
 	snaps   chan snapshotReq // plant snapshots for simulation jobs
+	fabIDs  map[string]int64 // equipment ids of the production records
+	fabOut  fabOut           // production records not stored yet
 }
 
 func newLive(ctx context.Context, db *pgxpool.Pool, plant *Plant, opts LiveOptions, seed uint64) *Live {
@@ -274,6 +282,9 @@ func (l *Live) Snapshot(ctx context.Context, seed uint64) (*Plant, error) {
 }
 
 func (l *Live) ensureClients() {
+	if l.opts.HTTP != nil {
+		return // no connections: every push is a request
+	}
 	for _, g := range gateways {
 		l.mu.Lock()
 		c := l.clients[g.Alias]
@@ -298,6 +309,9 @@ func (l *Live) ensureClients() {
 // Run publishes until the context is cancelled.
 func (l *Live) Run() error {
 	l.ensureClients()
+	if l.opts.HTTP != nil {
+		go l.opts.HTTP.pollCommands(l.ctx, time.Second, l.cmds)
+	}
 	tick := time.NewTicker(l.opts.Interval)
 	defer tick.Stop()
 	slowTick := time.NewTicker(15 * time.Second)
@@ -309,12 +323,14 @@ func (l *Live) Run() error {
 	for {
 		select {
 		case <-l.ctx.Done():
+			l.flushFab(context.Background())
 			_ = putSetting(context.Background(), l.db, stateKey, captureState(l.plant))
 			return nil
 		case <-slowTick.C:
 			l.ensureClients()
 			l.syncForced()
 			l.checkRepairs()
+			l.flushFab(l.ctx)
 		case <-saveTick.C:
 			if err := putSetting(l.ctx, l.db, stateKey, captureState(l.plant)); err != nil {
 				slog.Warn("save state", "err", err)
@@ -325,6 +341,7 @@ func (l *Live) Run() error {
 			l.scenario(now, dt)
 			values := l.plant.Step(now.UTC(), dt)
 			l.publish(values)
+			l.saveAMHS(now.UTC())
 		case req := <-l.snaps:
 			req.reply <- l.plant.Clone(req.seed)
 		case cmd := <-l.cmds:
@@ -346,6 +363,10 @@ func (l *Live) Run() error {
 }
 
 func (l *Live) publish(values map[*Asset]map[string]float64) {
+	if l.opts.HTTP != nil {
+		l.publishHTTP(values)
+		return
+	}
 	for _, a := range l.plant.Assets {
 		if a.Offline {
 			continue
@@ -368,6 +389,33 @@ func (l *Live) publish(values map[*Asset]map[string]float64) {
 		b, _ := json.Marshal(payload)
 		c.Publish(l.identity(a.Spec.Gateway)+"/"+a.Spec.Alias, 0, false, b)
 	}
+}
+
+// publishHTTP pushes the readings of every gateway's reporting equipment.
+func (l *Live) publishHTTP(values map[*Asset]map[string]float64) {
+	byGW := map[string]map[string]any{}
+	for _, a := range l.plant.Assets {
+		if a.Offline {
+			continue
+		}
+		m := byGW[a.Spec.Gateway]
+		if m == nil {
+			m = map[string]any{}
+			byGW[a.Spec.Gateway] = m
+		}
+		v := values[a]
+		for _, p := range a.Model.Params {
+			key := a.Spec.Alias + "/" + p.Alias
+			if p.Bool {
+				m[key] = v[p.Alias] == 1
+			} else {
+				m[key] = round(v[p.Alias], p.Scale)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(l.ctx, 4*time.Second)
+	defer cancel()
+	l.opts.HTTP.pushAll(ctx, byGW)
 }
 
 func (l *Live) activeFaults() int {
@@ -415,6 +463,60 @@ func (l *Live) scenario(now time.Time, dt float64) {
 }
 
 func (l *Live) uniform(a, b float64) float64 { return a + l.rng.Float64()*(b-a) }
+
+// flushFab stores the production records changed since the last flush; on
+// failure they are kept for the next one (up to a limit).
+func (l *Live) flushFab(ctx context.Context) {
+	f := l.plant.fab
+	if f == nil {
+		return
+	}
+	out := f.drain()
+	merge(&l.fabOut, out)
+	if l.fabOut.empty() {
+		return
+	}
+	if l.fabIDs == nil {
+		ids, err := equipmentIDs(ctx, l.db)
+		if err != nil {
+			slog.Warn("production records: equipment ids", "err", err)
+			return
+		}
+		l.fabIDs = ids
+	}
+	if err := f.upsertFab(ctx, l.db, l.fabOut, idLookup(l.fabIDs)); err != nil {
+		slog.Warn("store production records", "err", err, "lots", len(l.fabOut.lots), "steps", len(l.fabOut.steps))
+		if len(l.fabOut.steps) > 50000 {
+			l.fabOut = fabOut{}
+		}
+		return
+	}
+	l.fabOut = fabOut{}
+}
+
+// saveAMHS publishes the overhead transport state for the twin.
+func (l *Live) saveAMHS(now time.Time) {
+	f := l.plant.fab
+	if f == nil || f.AMHS == nil {
+		return
+	}
+	if err := putSetting(l.ctx, l.db, amhsStateKey, f.snapshot(now)); err != nil {
+		slog.Warn("save transport state", "err", err)
+	}
+}
+
+// merge adds newer production records to pending ones.
+func merge(dst *fabOut, src fabOut) {
+	for _, x := range src.lots {
+		dst.lot(x)
+	}
+	for _, x := range src.steps {
+		dst.step(x)
+	}
+	dst.met = append(dst.met, src.met...)
+	dst.scrap = append(dst.scrap, src.scrap...)
+	dst.transfers = append(dst.transfers, src.transfers...)
+}
 
 // syncForced stops equipment that maintenance put in a forced status.
 func (l *Live) syncForced() {
