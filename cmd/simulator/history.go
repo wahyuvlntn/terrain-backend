@@ -257,6 +257,8 @@ type History struct {
 	// copyValues stores parameter value rows (COPY into ts.parameter_values;
 	// tests count them in memory).
 	copyValues func(rows [][]any) (int64, error)
+	// fabStore stores the production records (prod schema present)
+	fabStore bool
 }
 
 type episode struct {
@@ -387,6 +389,13 @@ func (h *History) plan() {
 		a := h.plant.Assets[h.rng.IntN(len(h.plant.Assets))]
 		h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "trip"})
 	}
+	// process tools break down more often than facility equipment (about
+	// every two weeks per tool)
+	for _, a := range h.plant.group("tool") {
+		for i := poisson(h.rng, days/14); i > 0; i-- {
+			h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "trip"})
+		}
+	}
 	for i := 0; i < int(days/10); i++ {
 		a := h.plant.Assets[h.rng.IntN(len(h.plant.Assets))]
 		h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "offline", Dur: h.dur(8, 40)})
@@ -397,8 +406,12 @@ func (h *History) plan() {
 		switch a.Kind {
 		case "mau", "ct":
 			code = "GEN-003"
-		case "cda", "vac":
+		case "cda", "vac", "scrub", "pch":
 			code = "GEN-002"
+		default:
+			if toolPhysics[a.Kind] != nil {
+				code = "GEN-002"
+			}
 		}
 		h.episodes = append(h.episodes, &episode{At: at(0), Asset: a, Kind: "minor", Code: code})
 	}
@@ -770,7 +783,7 @@ func (h *History) advance(o *hOrder, t time.Time) {
 			d["Equipment Status"] = label
 			tr.forcedN++
 			tr.forced = o.forced
-			a.Maint = true
+			a.Maint, a.Forced = true, o.forced
 		}
 		o.events = append(o.events, hEvent{At: t, Status: "STARTED", By: o.Techs[0], Details: d})
 		if o.tripReset == -1 {
@@ -812,7 +825,7 @@ func (h *History) advance(o *hOrder, t time.Time) {
 			tr.forcedN--
 			if tr.forcedN <= 0 {
 				tr.forcedN, tr.forced = 0, 0
-				a.Maint = false
+				a.Maint, a.Forced = false, 0
 			}
 		}
 		if o.trip {
@@ -1269,6 +1282,11 @@ func (h *History) Store() error {
 		if err := h.storeOrders(tx); err != nil {
 			return err
 		}
+		if f := h.plant.fab; f != nil && h.fabStore {
+			if err := f.copyFab(h.ctx, tx, f.drain(), idLookup(h.ids.Equip)); err != nil {
+				return err
+			}
+		}
 		if len(h.ctlR) > 0 {
 			if _, err := tx.CopyFrom(h.ctx, pgx.Identifier{"asset", "control_requests"}, []string{"equipment_id", "equipment_parameter_id", "user_id",
 				"old_value", "value", "status", "reason", "requested_at", "completed_at"}, pgx.CopyFromRows(h.ctlR)); err != nil {
@@ -1290,6 +1308,10 @@ func ensurePartitions(ctx context.Context, db *pgxpool.Pool, from, to time.Time)
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) && pe.Code == "42883" { // undefined_function
 		slog.Warn("ts.ensure_parameter_values_partitions does not exist (parameter values not partitioned yet), continuing")
+		return nil
+	}
+	if errors.As(err, &pe) && pe.Code == "42501" { // insufficient_privilege: a maintenance job owns partitions (cloud)
+		slog.Warn("no privilege to create parameter value partitions; relying on the existing ones", "err", pe.Message)
 		return nil
 	}
 	if err != nil {
@@ -1489,6 +1511,13 @@ func runHistory(ctx context.Context, db *pgxpool.Pool, plant *Plant, days int, s
 		return nil, err
 	}
 	h := newHistory(ctx, db, plant, ids, days, seed)
+	if plant.fab != nil {
+		if err := clearProduction(ctx, db); err != nil {
+			slog.Warn("production records not generated", "err", err)
+		} else {
+			h.fabStore = true
+		}
+	}
 	if err := ensurePartitions(ctx, db, h.start, h.end); err != nil {
 		return nil, err
 	}
@@ -1506,6 +1535,6 @@ func runHistory(ctx context.Context, db *pgxpool.Pool, plant *Plant, days int, s
 	}
 	slog.Info("history stored", "took", time.Since(started).Round(time.Second), "values", h.nValues, "status_intervals", len(h.statusR),
 		"alarm_events", len(h.eventR), "orders", len(h.orders), "notifications", len(h.notifR), "order_states", stats,
-		"lbnl_episodes", len(h.fdd), "control_requests", len(h.ctlR))
+		"lbnl_episodes", len(h.fdd), "control_requests", len(h.ctlR), "production", h.fabStore)
 	return h, nil
 }
