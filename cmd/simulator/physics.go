@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"time"
+
+	"afdd/internal/engine"
 )
 
 // ar is a first-order autoregressive (Ornstein-Uhlenbeck) noise process with
@@ -46,6 +48,9 @@ type Asset struct {
 	Forced     int  // forced status id of the maintenance (3 unplanned, 5 planned down; 0 none)
 	Offline    bool
 	OffUntil   time.Time
+	// Interlock stops a process tool whose dry pump, scrubber or process
+	// chiller is down: its status (engineUnplanned or engineScheduled; 0 none).
+	Interlock int
 
 	Faults     map[string]*Fault
 	FilterDays float64 // MAU natural pre-filter loading (days since last service)
@@ -66,6 +71,19 @@ type Asset struct {
 	phase  float64            // dry pump process cycle offset (seconds)
 	last   map[string]float64 // true values of the last step (physics coupling)
 	meas   map[string]float64 // measured values of the last step (sensor faults applied)
+
+	// Production coupling: a process tool's production state (a litho track:
+	// its cell's) and support units; a coupled dry pump takes its process gas
+	// load (ProcLoad, 0..1) from its tool instead of its own process cycle; a
+	// scrubber or process chiller takes its load from the tools it serves.
+	tool     *FabTool
+	cell     *FabTool
+	vacPump  *Asset
+	abate    *Asset
+	coolant  *Asset
+	served   []*Asset
+	Coupled  bool
+	ProcLoad float64
 }
 
 func newAsset(spec *EquipSpec, m *ModelSpec, idx int, r *rand.Rand) *Asset {
@@ -153,8 +171,15 @@ func (a *Asset) fval(kind string) (float64, bool) {
 	return 0, false
 }
 
-// Running reports whether the equipment is producing.
-func (a *Asset) Running() bool { return a.Duty && !a.Trip && !a.Maint }
+// Running reports whether the equipment is producing (a process tool: up,
+// available for production).
+func (a *Asset) Running() bool { return a.Duty && !a.Trip && !a.Maint && a.Interlock == 0 }
+
+// Interlock statuses of a process tool (engine status ids).
+const (
+	engineUnplanned = engine.StatusUnplannedDown
+	engineScheduled = engine.StatusPlannedDown
+)
 
 // Env is the plant environment at an instant.
 type Env struct {
@@ -227,6 +252,14 @@ func (a *Asset) Values(t time.Time, env Env, dt float64) map[string]float64 {
 		a.compressor(v, t, env, run, dt)
 	case "vac":
 		a.dryPump(v, t, env, run, dt)
+	case "scrub":
+		a.scrubber(v, t, env, run, dt)
+	case "pch":
+		a.processChiller(v, t, env, run, dt)
+	default:
+		if toolPhysics[a.Kind] != nil {
+			a.processTool(v, t, run, dt)
+		}
 	}
 	if spike && a.TripSpec != nil && a.TripSpec.Param != "" {
 		v[a.TripSpec.Param] = a.TripSpec.Spike + a.n("spike", 0.5, 20, dt)
@@ -623,8 +656,11 @@ func (a *Asset) dryPump(v map[string]float64, t time.Time, env Env, run bool, dt
 	dep, rotor, purge := a.sev("deposition"), a.sev("rotor_wear"), a.sev("purge_block")
 	cvd := a.Model.Name == "Edwards iXH610 Dry Pump (CVD)"
 	bodyBase := 84.0
-	if cvd {
+	switch {
+	case cvd:
 		bodyBase = 90
+	case a.Model.Name == "Edwards iXL750 Dry Pump (Clean)":
+		bodyBase = 70
 	}
 	v["n2_flow"] = 52 - 27*purge + a.n("n2", 0.5, 120, dt)
 	v["cooling_water_flow"] = 5.2 + a.n("cw", 0.05, 300, dt)
@@ -639,6 +675,9 @@ func (a *Asset) dryPump(v map[string]float64, t time.Time, env Env, run bool, dt
 	proc := 0.0
 	if cycle < 1080 {
 		proc = 1
+	}
+	if a.Coupled {
+		proc = a.ProcLoad
 	}
 	gas := a.lag("gas", proc, 60, dt)
 	// Degradation adds to the readings in every step so alarms do not
