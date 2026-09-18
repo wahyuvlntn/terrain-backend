@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -32,7 +34,9 @@ func (s *Seeder) Run(ctx context.Context) error {
 		fn   func(context.Context) error
 	}{
 		{"master data", s.masterData},
+		{"location renames", s.renameLocations},
 		{"locations", s.locations},
+		{"retired equipment", s.retire},
 		{"models", s.models},
 		{"data sources", s.gateways},
 		{"equipment", s.equipment},
@@ -41,6 +45,7 @@ func (s *Seeder) Run(ctx context.Context) error {
 		{"users", s.users},
 		{"personnel", s.personnel},
 		{"instructions", s.instructions},
+		{"products", s.products},
 	}
 	for _, st := range steps {
 		slog.Info("seeding", "step", st.name)
@@ -231,13 +236,19 @@ func (s *Seeder) models(ctx context.Context) error {
 	return nil
 }
 
+// gatewayType is the protocol of the simulator's gateways: MQTT_SERVER (it
+// publishes to the backend's broker) or REST_SERVER (SIM_TRANSPORT=http).
+var gatewayType = "MQTT_SERVER"
+
 func (s *Seeder) gateways(ctx context.Context) error {
 	for _, g := range gateways {
 		if !exists(ctx, s.db, `SELECT 1 FROM dh.gateways WHERE lower(alias) = lower($1)`, g.Alias) {
-			if _, err := s.call(ctx, "gateway/addgateway", map[string]any{"alias": g.Alias, "name": g.Name, "type": "MQTT_SERVER",
+			if _, err := s.call(ctx, "gateway/addgateway", map[string]any{"alias": g.Alias, "name": g.Name, "type": gatewayType,
 				"description": g.Description, "params": "{}"}); err != nil {
 				return err
 			}
+		} else if err := convertGateway(ctx, s.db, g.Alias); err != nil {
+			return err
 		}
 		var tags []map[string]string
 		for _, e := range equipment() {
@@ -264,6 +275,33 @@ func (s *Seeder) gateways(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// convertGateway switches an existing gateway to the simulator's transport
+// (a database seeded for MQTT, run with SIM_TRANSPORT=http, or back).
+func convertGateway(ctx context.Context, db *pgxpool.Pool, alias string) error {
+	var typ string
+	if err := db.QueryRow(ctx, `SELECT type FROM dh.gateways WHERE lower(alias) = lower($1)`, alias).Scan(&typ); err != nil || typ == gatewayType {
+		return err
+	}
+	secret, key := "mqtt_password", randomSecret()
+	if gatewayType == "REST_SERVER" {
+		secret = "api_key"
+	}
+	if _, err := db.Exec(ctx, `UPDATE dh.gateways SET type = $2, secrets = secrets || jsonb_build_object($3::text, $4::text), updated_at = now()
+		WHERE lower(alias) = lower($1)`, alias, gatewayType, secret, key); err != nil {
+		return err
+	}
+	// the backend reloads it (the processing worker on the event, the API replicas within 30 s)
+	_, _ = db.Exec(ctx, `INSERT INTO core.runtime_events (kind, key) VALUES ('gateway', $1)`, alias)
+	slog.Info("gateway converted", "alias", alias, "from", typ, "to", gatewayType)
+	return nil
+}
+
+func randomSecret() string {
+	b := make([]byte, 12)
+	_, _ = cryptorand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func findModel(name string) *ModelSpec {
@@ -537,6 +575,80 @@ func (s *Seeder) issueMapping(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// renameLocations applies location renames of the plant definition.
+func (s *Seeder) renameLocations(ctx context.Context) error {
+	for _, r := range locationRenames {
+		if _, err := s.db.Exec(ctx, `UPDATE asset.locations SET name = $2 WHERE name = $1
+			AND NOT EXISTS (SELECT 1 FROM asset.locations WHERE name = $2)`, r[0], r[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// retiredAliases are equipment of earlier plant definitions that no longer
+// exist (FAB1 tool set of seed version 7).
+var retiredAliases = []string{"CVD_03", "MET_02"}
+
+// retire removes the equipment that left the plant definition and the
+// equipment whose model changed (it is added again with its new model by the
+// equipment step; history regeneration follows such changes), and moves
+// equipment to its current location.
+func (s *Seeder) retire(ctx context.Context) error {
+	want := map[string]*EquipSpec{}
+	for _, e := range equipment() {
+		want[strings.ToLower(e.Alias)] = e
+	}
+	rows, err := s.db.Query(ctx, `SELECT e.id, e.alias, m.name, l.name FROM asset.equipment e
+		JOIN asset.models m ON m.id = e.model_id JOIN asset.locations l ON l.id = e.location_id`)
+	if err != nil {
+		return err
+	}
+	type eq struct {
+		id               int64
+		alias, model, at string
+	}
+	var all []eq
+	for rows.Next() {
+		var e eq
+		if err := rows.Scan(&e.id, &e.alias, &e.model, &e.at); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, e := range all {
+		w := want[strings.ToLower(e.alias)]
+		if (w == nil && contains(retiredAliases, e.alias)) || (w != nil && w.Model != e.model) {
+			slog.Info("retiring equipment", "alias", e.alias, "model", e.model)
+			if _, err := s.db.Exec(ctx, `DELETE FROM asset.equipment WHERE id = $1`, e.id); err != nil {
+				return fmt.Errorf("retire %s: %w", e.alias, err)
+			}
+			continue
+		}
+		if w != nil && w.Location != e.at {
+			if _, err := s.db.Exec(ctx, `UPDATE asset.equipment SET location_id = $2, updated_at = now() WHERE id = $1`, e.id,
+				s.locationID(ctx, w.Location)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// products stores the products and routes of the production model.
+func (s *Seeder) products(ctx context.Context) error {
+	if !prodReady(ctx, s.db) {
+		slog.Warn("schema prod missing or old (migrations 0008 / 0009): products not stored")
+		return nil
+	}
+	return upsertProducts(ctx, s.db)
 }
 
 func (s *Seeder) instructions(ctx context.Context) error {
