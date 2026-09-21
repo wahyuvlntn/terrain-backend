@@ -1027,6 +1027,8 @@ func (r *JobRunner) execute(job *simJob) {
 			summary, err = r.scenario(ctx, job, stepS, rec, progress)
 		case "doe":
 			summary, err = r.doe(ctx, job, stepS, rec, progress)
+		case "production":
+			summary, err = r.production(ctx, job, progress)
 		default:
 			err = fmt.Errorf("unknown job kind %q", job.Kind)
 		}
@@ -1046,7 +1048,7 @@ func (r *JobRunner) execute(job *simJob) {
 		return
 	}
 	summary["runtime_ms"] = time.Since(started).Milliseconds()
-	if err := r.complete(job.ID, rec, summary); err != nil {
+	if err := r.complete(job.ID, job.Kind, rec, summary); err != nil {
 		if errors.Is(err, errJobGone) {
 			slog.Info("simulation job no longer running, results dropped", "job", job.ID)
 			return
@@ -1083,6 +1085,7 @@ func (r *JobRunner) scenario(ctx context.Context, job *simJob, stepS int, rec Re
 		}
 		base = p
 	}
+	base.dropFab() // facility scenarios: the process tools stay idle
 	spec, err := parseScenario(job.Spec, base, jobMaxMinutes(job.Origin))
 	if err != nil {
 		return nil, err
@@ -1121,15 +1124,20 @@ func (r *JobRunner) fail(id int64, cause error) {
 // analytics service (ANALYZING: anomaly and FDD events and the variant
 // comparison of a scenario, the sample count of a DOE; it then sets
 // SUCCEEDED) in one transaction, then notifies.
-func (r *JobRunner) complete(id int64, rec *MemRecorder, summary map[string]any) error {
+func (r *JobRunner) complete(id int64, kind string, rec *MemRecorder, summary map[string]any) error {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Minute)
 	defer cancel()
+	// a production plan is analysed by the simulator itself
+	status, finished := "ANALYZING", false
+	if kind == "production" {
+		status, finished = "SUCCEEDED", true
+	}
 	return pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
 		if err := writeResults(ctx, tx, id, rec); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE sim.jobs SET status = 'ANALYZING', progress = 1, summary = $2, updated_at = now()
-			WHERE id = $1 AND status = 'RUNNING'`, id, summary)
+		tag, err := tx.Exec(ctx, `UPDATE sim.jobs SET status = $3, progress = 1, summary = $2, updated_at = now(),
+			finished_at = CASE WHEN $4 THEN now() ELSE finished_at END WHERE id = $1 AND status = 'RUNNING'`, id, summary, status, finished)
 		if err != nil {
 			return err
 		}

@@ -254,6 +254,8 @@ func (r *JobRunner) doe(ctx context.Context, job *simJob, stepS int, rec Recorde
 		job.ID, start, end, stepS); err != nil {
 		return nil, err
 	}
-	run := &doeRun{Spec: spec, Base: newPlant(seed, r.loc), Seed: seed, Start: start, StepS: stepS, Rec: rec, Progress: progress}
+	base := newPlant(seed, r.loc)
+	base.dropFab()
+	run := &doeRun{Spec: spec, Base: base, Seed: seed, Start: start, StepS: stepS, Rec: rec, Progress: progress}
 	return run.run(ctx)
 }
