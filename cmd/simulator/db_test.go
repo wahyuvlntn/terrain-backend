@@ -453,11 +453,27 @@ func TestHistoryStoreDB(t *testing.T) {
 		t.Errorf("history rows: FDD alarms %d, control requests %d of %d, orders %d of %d, FDD orders %d, notes %d",
 			fdd, ctl, len(h.ctlR), orders, len(h.orders), fddOrders, notes)
 	}
+	// production records: lots, process runs on the tools, metrology with
+	// its source tool, the lot step id sequence past the explicit ids
+	lots := count(t, pool, `SELECT count(*) FROM prod.lots`)
+	runs := count(t, pool, `SELECT count(*) FROM prod.lot_steps WHERE status = 'DONE' AND equipment_id IS NOT NULL AND theoretical_s > 0`)
+	met := count(t, pool, `SELECT count(*) FROM prod.metrology WHERE source_equipment_id IS NOT NULL AND metrology_equipment_id IS NOT NULL`)
+	wip := count(t, pool, `SELECT count(*) FROM prod.lots WHERE status IN ('QUEUED', 'PROCESSING', 'AWAY', 'HOLD')`)
+	seq := count(t, pool, `SELECT (last_value = (SELECT max(id) FROM prod.lot_steps))::int FROM prod.lot_steps_id_seq`)
+	t.Logf("production: %d lots (%d in progress), %d runs, %d metrology results, %d route steps", lots, wip, runs, met,
+		count(t, pool, `SELECT count(*) FROM prod.route_steps`))
+	if !h.fabStore || lots < 150 || lots-wip < 100 || runs < 20000 || met < 5000 || wip == 0 || seq != 1 {
+		t.Errorf("production rows: stored %v, lots %d, runs %d, metrology %d, WIP %d, sequence ok %d", h.fabStore, lots, runs, met, wip, seq)
+	}
 	// a second run replaces the history (clearExisting) instead of adding to it
 	if _, err := runHistory(ctx, pool, newPlant(7, testLoc), 3, 7); err != nil {
 		t.Fatal(err)
 	}
 	if n := count(t, pool, `SELECT count(*) FROM asset.control_requests WHERE requested_at < now() - interval '4 days'`); n != 0 {
 		t.Errorf("%d control requests of the first run left", n)
+	}
+	// (the second run's warm-up starts 45 days back, the first run's 52)
+	if n := count(t, pool, `SELECT count(*) FROM prod.lots WHERE released_at < now() - interval '49 days'`); n != 0 {
+		t.Errorf("%d lots of the first run left", n)
 	}
 }
