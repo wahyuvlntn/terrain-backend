@@ -44,7 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..common import gemini
 from ..common.config import Settings, get_settings
-from . import budget, navigation, stream
+from . import budget, convlock, navigation, stream
 from . import state as st
 from .backend_api import plant_tz
 from .agents import APP_NAME, DEEP, INSIGHT, ROOT, TWIN, build_root_agent
@@ -107,7 +107,7 @@ def friendly_error(err: BaseException) -> str:
     return "Something went wrong while answering. Please try again."
 
 
-def _release_lock(lock: asyncio.Lock) -> None:
+def _release_lock(lock: Any) -> None:
     if lock.locked():
         lock.release()
 
@@ -129,7 +129,7 @@ class ChatTurn:
     context: dict[str, Any] | None
     refusal: str | None = None
     abort: asyncio.Event = field(default_factory=asyncio.Event)
-    lock: asyncio.Lock | None = None
+    lock: Any = None  # convlock.Held: this instance's lock plus the shared lease
 
     def __post_init__(self) -> None:
         self._unlock = weakref.finalize(self, _release_lock, self.lock) if self.lock is not None else None
@@ -278,13 +278,23 @@ class AgentService:
             lock = self._locks[session_id] = asyncio.Lock()
         return lock
 
-    async def _acquire(self, session_id: str) -> asyncio.Lock:
-        """The conversation's lock, held by the caller; ConversationBusy when a turn holds it."""
+    async def _acquire(self, session_id: str) -> convlock.Held:
+        """The conversation's lock, held by the caller; ConversationBusy when a turn holds it, here or on
+        another instance (the shared lease of convlock)."""
         lock = self._lock(session_id)
         if lock.locked():
             raise ConversationBusy(session_id)
         await lock.acquire()  # free: taken at once, nothing else runs between the check and here
-        return lock
+        try:
+            shared = await convlock.acquire(session_id)
+        except Exception as err:  # noqa: BLE001 - without the database only this instance's lock guards it
+            log.warning("conversation lease unavailable session=%s: %s", session_id, err)
+            return convlock.Held(session_id, lock, False)
+        if not shared:
+            lock.release()
+            self._prune_lock(session_id)
+            raise ConversationBusy(session_id)
+        return convlock.Held(session_id, lock, True)
 
     def _prune_lock(self, session_id: str) -> None:
         """Forget a lock nobody holds (every user of a lock holds it, so this never drops one in use)."""
