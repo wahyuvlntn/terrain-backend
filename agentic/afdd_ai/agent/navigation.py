@@ -39,6 +39,7 @@ Page = Literal[
     "digital-twin",
     "ai-insights",
     "simulation",
+    "production",
     "asset-overview",
     "alarm-report",
     "maintenance-order",
@@ -55,6 +56,7 @@ PAGES: dict[str, tuple[str, str, frozenset[str]]] = {
     "digital-twin": ("the digital twin", "digitaltwin", frozenset({"asset", "parameter", "location", "view", "panel"})),
     "ai-insights": ("AI Insights", "aiinsights", frozenset({"tab", "item_id"})),
     "simulation": ("Simulation", "simulation", frozenset({"item_id", "section"})),
+    "production": ("Production", "production", frozenset({"section"})),
     "asset-overview": ("Equipment overview", "equipmentoverview", frozenset({"asset", "section"})),
     "alarm-report": ("Alarm report", "alarmsreport", frozenset()),
     "maintenance-order": ("Maintenance orders", "maintenanceorder", frozenset()),
@@ -68,7 +70,11 @@ PAGES: dict[str, tuple[str, str, frozenset[str]]] = {
 
 TABS = ("recommendations", "faults", "anomalies", "documents", "rules", "injection")
 ITEM_TABS = frozenset({"recommendations", "faults", "anomalies"})  # tabs whose item_id selects a row
-SECTIONS = {"simulation": ("new",), "asset-overview": ("status", "parameters", "spc")}
+SECTIONS = {
+    "simulation": ("new", "new-plan"),
+    "production": ("overview", "tools", "lots", "quality"),
+    "asset-overview": ("status", "parameters", "spc"),
+}
 VIEWS = ("walk", "orbit")
 PANELS = ("plant-overview",)
 
@@ -76,14 +82,32 @@ PANELS = ("plant-overview",)
 _TAB_ALIASES = {"recommendation": "recommendations", "fault": "faults", "anomaly": "anomalies", "document": "documents", "rule": "rules", "fault-injection": "injection"}
 _VIEW_ALIASES = {"walk-mode": "walk", "first-person": "walk", "fpv": "walk"}
 _PANEL_ALIASES = {"plant": "plant-overview", "bms": "plant-overview", "bms-overview": "plant-overview", "bms-plant-overview": "plant-overview"}
-_SECTION_ALIASES = {"new-scenario": "new", "scenario-builder": "new", "builder": "new"}
+_SECTION_ALIASES = {
+    "new-scenario": "new",
+    "scenario-builder": "new",
+    "builder": "new",
+    "new-production-plan": "new-plan",
+    "production-plan": "new-plan",
+    "plan": "new-plan",
+    "kpi": "overview",
+    "oee": "overview",
+    "equipment": "tools",
+    "lot": "lots",
+    "wip": "lots",
+}
 
 # The plant's locations (simulator seed); the twin binds its 3D scenes to these names.
 LOCATIONS = (
     "FAB1 Wafer Fab",
     "FAB1 L1 Sub-Fab",
-    "Sub-Fab Bay A (Etch)",
-    "Sub-Fab Bay B (CVD)",
+    "Sub-Fab North",
+    "Sub-Fab South",
+    "FAB1 L2 Cleanroom",
+    "Photo Bay",
+    "Etch & Thin Film Bay",
+    "Implant & CMP Bay",
+    "Diffusion Bay",
+    "Wet & Metrology Bay",
     "FAB1 L4 Mechanical Deck",
     "MAU Plant Room North",
     "MAU Plant Room South",
@@ -95,11 +119,15 @@ LOCATIONS = (
     "CUB Roof",
     "Cooling Tower Yard",
 )
-LOCATIONS_3D = frozenset(
-    {"CUB Central Utility Building", "CUB L1 Utility Floor", "Chiller Plant Room", "PCW Pump Room", "CDA Compressor Room", "CUB Roof", "Cooling Tower Yard"}
+# Every location has a 3D scene (the FAB1 building, sub-fab rooms, the L2 cleanroom and its five bays,
+# the L4 MAU rooms, the CUB rooms and roof).
+LOCATIONS_3D = frozenset(LOCATIONS)
+# Equipment kinds (alias prefix) with a 3D model in the twin: every unit of the plant, the FAB1
+# production tools and the sub-fab support units.
+MODELLED_KINDS = frozenset(
+    {"CH", "CHWP", "CWP", "CT", "CHWS", "PCWP", "CDA", "MAU", "DP", "SCR", "PCH"}
+    | {"SCN", "STP", "TRK", "ETCH", "CVD", "PVD", "ECP", "CMP", "FRN", "RTP", "IMP", "WET", "SWC", "ASH", "MET", "CDS", "OVL", "DEF", "WAT"}
 )
-# Equipment kinds (alias prefix) with a 3D model in the twin (every CUB unit since 2026-10-12).
-MODELLED_KINDS = frozenset({"CH", "CHWP", "CWP", "CT", "CHWS", "PCWP", "CDA"})
 # Unmodelled kinds whose room has a 3D scene: the twin shows the room (none at the moment).
 ROOM_ONLY_KINDS: dict[str, str] = {}
 # The location whose 3D scene holds the plant the BMS plant overview shows (CHWS_01).
@@ -160,12 +188,18 @@ def _match_locations(text: str, names: Sequence[str]) -> list[str]:
     return exact or [name for name in names if lowered in name.lower()]
 
 
+# Former location names (renamed with the FAB1 production line, 2026-10-13).
+LOCATION_ALIASES = {"sub-fab bay a (etch)": "Sub-Fab North", "sub-fab bay b (cvd)": "Sub-Fab South", "bay a": "Sub-Fab North",
+                    "bay b": "Sub-Fab South", "cleanroom": "FAB1 L2 Cleanroom", "litho bay": "Photo Bay", "lithography bay": "Photo Bay"}
+
+
 def resolve_location(value: Any, visible: Sequence[str] = LOCATIONS) -> str | None:
     """Canonical name of a location the user can see (case-insensitive; a unique partial name is
     accepted). A plant location outside `visible` is refused as outside the user's access."""
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return None
+    text = LOCATION_ALIASES.get(text.lower(), text)
     found = _match_locations(text, visible)
     if len(found) == 1:
         return found[0]
@@ -229,7 +263,12 @@ def default_label(nav: Mapping[str, Any], unit_name: str | None = None, param_na
     if page == "simulation":
         if nav.get("item_id"):
             return f"Simulation #{nav['item_id']}"
+        if nav.get("section") == "new-plan":
+            return "New production plan"
         return "New simulation scenario" if nav.get("section") == "new" else "Simulation jobs"
+    if page == "production":
+        tab = nav.get("section")
+        return f"Production: {tab}" if tab else "Production monitoring"
     if page == "asset-overview" and unit:
         section = {"status": " (status)", "parameters": " (parameters)", "spc": " (SPC)"}.get(str(nav.get("section")), "")
         return f"{unit} equipment details{section}"
@@ -325,6 +364,8 @@ async def open_in_app(
                 nav["section"] = None
         if page_key == "asset-overview":
             nav["section"] = _enum(section, SECTIONS["asset-overview"], {}, "section")
+        if page_key == "production":
+            nav["section"] = _enum(section, SECTIONS["production"], _SECTION_ALIASES, "section")
 
         unit: Mapping[str, Any] | None = None
         param: Mapping[str, Any] | None = None

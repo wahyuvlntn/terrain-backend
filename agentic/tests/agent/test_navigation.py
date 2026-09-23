@@ -21,7 +21,7 @@ from .test_app_sessions import HEADERS, chat, client, scratch_db  # noqa: F401 -
 PERMS = ["aiassistant.read", "digitaltwin.read", "aiinsights.read", "simulation.read", "equipmentoverview.read", "alarmsreport.read"]
 # A user whose location scope is FAB1 only (like the demo's fab facilities groups).
 FAB1_TOKEN = "tok-fab1-nav"
-FAB1_LOCATIONS = navigation.LOCATIONS[:7]
+FAB1_LOCATIONS = navigation.LOCATIONS[: navigation.LOCATIONS.index("MAU Plant Room South") + 1]
 
 
 @pytest.fixture(autouse=True)
@@ -90,14 +90,13 @@ async def test_invalid_arguments_come_back_as_errors(fake_backend):
         ({"page": "digital-twin", "parameter": "chwst"}, "parameter needs asset"),
         ({"page": "digital-twin", "location": "Basement"}, "Unknown location 'Basement'. Locations: FAB1 Wafer Fab"),
         ({"page": "digital-twin", "location": "room"}, "matches several locations"),
-        ({"page": "digital-twin", "location": "MAU Plant Room North", "view": "walk"}, "MAU Plant Room North has no 3D model, so walk mode cannot go there"),
         ({"page": "digital-twin", "view": "fly"}, "Unknown view 'fly'. Use one of: walk, orbit."),
         ({"page": "digital-twin", "panel": "alarms"}, "Unknown panel 'alarms'"),
         ({"page": "ai-insights", "tab": "trends"}, "Unknown tab 'trends'"),
         ({"page": "ai-insights", "item_id": 5}, "item_id needs its tab"),
         ({"page": "ai-insights", "tab": "faults", "item_id": "abc"}, "item_id must be a whole number"),
         ({"page": "ai-insights", "tab": "faults", "item_id": -3}, "item_id must be a positive id"),
-        ({"page": "simulation", "section": "results"}, "Unknown section 'results'. Use one of: new."),
+        ({"page": "simulation", "section": "results"}, "Unknown section 'results'. Use one of: new, new-plan."),
         ({"page": "asset-overview", "asset": "CH_01", "section": "alarms"}, "Unknown section 'alarms'"),
     ]
     for kwargs, expected in cases:
@@ -136,7 +135,31 @@ async def test_other_pages_keep_only_their_fields(fake_backend):
     assert "Ignored (not used by alarm-report): asset, view." in report["note"]
 
 
-async def test_units_and_places_without_3d_models_are_flagged(fake_backend):
+async def test_fab1_units_and_places_are_modelled(fake_backend):
+    extra = [
+        {**ASSETS[0], "id": 31, "alias": "MAU_01", "name": "Make-up Air Unit MAU-01", "type_name": "Make-up Air Unit"},
+        {**ASSETS[0], "id": 33, "alias": "DP_04", "name": "Dry Pump DP-04", "type_name": "Dry Vacuum Pump"},
+    ]
+    fake_backend.handlers["digital_twin/getassets"] = lambda body, tok: ASSETS + extra
+    try:
+        mau = await open_(page="digital-twin", asset="MAU_01", view="walk")
+        assert mau["navigation"]["asset_id"] == 31 and mau["navigation"]["view"] == "walk" and "3D" not in mau["note"]
+        dp = await open_(page="digital-twin", asset="dp-4")
+        assert dp["navigation"]["asset"] == "DP_04" and "3D" not in dp["note"]
+        room = await open_(page="digital-twin", location="MAU Plant Room North", view="walk")
+        assert room["navigation"]["location"] == "MAU Plant Room North" and room["navigation"]["view"] == "walk"
+        fab = await open_(page="digital-twin", location="fab1 wafer fab")
+        assert fab["navigation"]["location"] == "FAB1 Wafer Fab" and "3D" not in fab["note"]
+    finally:
+        fake_backend._install_defaults()
+
+
+async def test_units_and_places_without_3d_models_are_flagged(fake_backend, monkeypatch):
+    # every unit and location is modelled today: take the MAUs and a bay out to keep the path tested
+    monkeypatch.setattr(navigation, "MODELLED_KINDS", navigation.MODELLED_KINDS - {"MAU"})
+    monkeypatch.setattr(navigation, "LOCATIONS_3D", navigation.LOCATIONS_3D - {"Sub-Fab North", "MAU Plant Room North"})
+    no_room = await open_(page="digital-twin", location="MAU Plant Room North", view="walk")
+    assert "MAU Plant Room North has no 3D model, so walk mode cannot go there" in no_room["error"]
     extra = [
         {**ASSETS[0], "id": 31, "alias": "MAU_01", "name": "Make-up Air Unit MAU-01", "type_name": "Make-up Air Unit"},
         {**ASSETS[0], "id": 32, "alias": "PCWP_02", "name": "PCW Pump PCWP-02", "type_name": "Process Cooling Water Pump"},
@@ -155,7 +178,9 @@ async def test_units_and_places_without_3d_models_are_flagged(fake_backend):
         ct = await open_(page="digital-twin", asset="CT_01")
         assert "3D" not in ct["note"]
         fab = await open_(page="digital-twin", location="sub-fab bay a (etch)")
-        assert fab["navigation"]["location"] == "Sub-Fab Bay A (Etch)" and "has no 3D model yet" in fab["note"]
+        assert fab["navigation"]["location"] == "Sub-Fab North" and "has no 3D model yet" in fab["note"]
+        empty = await open_(ctx(walk=True), page="digital-twin", location="Sub-Fab North")
+        assert empty["navigation"]["view"] is None and "nothing in 3D to walk to" in empty["note"]
     finally:
         fake_backend._install_defaults()
 
@@ -204,8 +229,8 @@ async def test_a_walking_user_stays_in_walk_mode(fake_backend):
     assert (await open_(ctx(walk=True), page="digital-twin", panel="plant-overview"))["navigation"]["view"] == "walk"
     assert (await open_(ctx(walk=True), page="digital-twin", location="tower yard"))["navigation"]["view"] == "walk"
     assert (await open_(ctx(walk=True), page="digital-twin", view="orbit"))["navigation"]["view"] == "orbit"  # only orbit leaves
-    empty = await open_(ctx(walk=True), page="digital-twin", location="Sub-Fab Bay A (Etch)")
-    assert empty["navigation"]["view"] is None and "nothing in 3D to walk to" in empty["note"]
+    bay = await open_(ctx(walk=True), page="digital-twin", location="Sub-Fab North")
+    assert bay["navigation"]["view"] == "walk"  # every FAB1 location has a 3D scene since 2026-10-12
     assert (await open_(ctx(walk=True), page="alarm-report"))["navigation"]["view"] is None
     assert (await open_(page="digital-twin", asset="CT_01"))["navigation"]["view"] is None  # not walking
 
@@ -237,7 +262,7 @@ async def test_places_outside_the_users_location_scope_are_refused(fake_backend)
     overview = await open_(fab, page="digital-twin", panel="plant-overview")
     assert "BMS plant overview shows the chiller plant (Chiller Plant Room), which is outside the user's location access" in overview["error"]
     bay = await open_(fab, page="digital-twin", location="bay a")
-    assert bay["navigation"]["location"] == "Sub-Fab Bay A (Etch)"
+    assert bay["navigation"]["location"] == "Sub-Fab North"
     unknown = await open_(fab, page="digital-twin", location="Basement")
     assert "Unknown location 'Basement'. Locations: FAB1 Wafer Fab, FAB1 L1 Sub-Fab," in unknown["error"] and "Cooling" not in unknown["error"]
     assert all(c["token"] == FAB1_TOKEN for c in fake_backend.calls_to("filter/getalllocationsandassets"))
