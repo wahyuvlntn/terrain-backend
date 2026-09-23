@@ -32,6 +32,7 @@ from google.adk.models.base_llm import BaseLlm
 from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
 from google.genai import types
 
+from ..common import gcp
 from ..common.config import Settings, get_settings
 from ..common.gemini import sampling_temperature, thinking_config
 from . import budget, charts, context, navigation, prompts, rag_tool, tools_backend
@@ -56,6 +57,7 @@ INSIGHT_DB_TOOLS = ["query_parameter_history", "get_energy_summary", "get_point_
 AGENT_SECRET_HEADER = "X-Agent-Secret"
 AGENT_SESSION_HEADER = "X-AFDD-Agent-Session"
 USER_ID_HEADER = "X-AFDD-User-Id"
+SERVERLESS_AUTH_HEADER = "X-Serverless-Authorization"
 MCP_TIMEOUT_S = 20.0
 MCP_TOOL_LIST_TTL_S = 300.0
 
@@ -88,6 +90,22 @@ def mcp_header_provider(settings: Settings):
     return headers
 
 
+def mcp_headers(settings: Settings, url: str):
+    """`mcp_header_provider` plus, for a private Cloud Run MCP service (MCP_ID_TOKEN), a Google ID
+    token of this service account (X-Serverless-Authorization; the user's session stays in Authorization)."""
+    base = mcp_header_provider(settings)
+    if not settings.mcp_id_token:
+        return base
+    aud = gcp.audience(url)
+
+    def headers(ctx: ReadonlyContext | None) -> dict[str, str]:
+        out = base(ctx)
+        out[SERVERLESS_AUTH_HEADER] = f"Bearer {gcp.id_token(aud)}"
+        return out
+
+    return headers
+
+
 class PlantMcpToolset(McpToolset):
     """An `McpToolset` that offers no tools while its server is unreachable.
 
@@ -114,7 +132,7 @@ def mcp_toolset(url: str, settings: Settings, tool_filter: list[str] | None = No
         connection_params=StreamableHTTPConnectionParams(url=url, timeout=MCP_TIMEOUT_S, sse_read_timeout=120.0),
         tool_filter=tool_filter,
         tool_list_cache_ttl_seconds=MCP_TOOL_LIST_TTL_S,
-        header_provider=mcp_header_provider(settings),
+        header_provider=mcp_headers(settings, url),
     )
 
 

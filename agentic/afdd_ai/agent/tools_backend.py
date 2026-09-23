@@ -785,6 +785,15 @@ ALLOWED_SCRIPTS: dict[str, dict[str, str]] = {
     "simulation/getjob": {"job_id": "int"},
     "simulation/getevents": {"job_id": "int", "variant": "str", "kinds": "str", "asset": "str", "limit": "int", "offset": "int"},
     "simulation/getfaultcatalog": {},
+    "production/getoverview": {"hours": "int"},
+    "production/gettools": {"hours": "int"},
+    "production/gettrend": {"days": "int", "bucket": "str", "tool_type": "str", "equipment_id": "int"},
+    "production/gettimeline": {"hours": "int", "equipment_ids": "str"},
+    "production/getlots": {"status": "str", "search": "str", "product_code": "str", "area": "str", "page": "int", "limit": "int"},
+    "production/getlot": {"lot_code": "str"},
+    "production/getqualitykeys": {"hours": "int"},
+    "production/getquality": {"char_key": "str", "hours": "int", "equipment_id": "int"},
+    "production/getplanning": {},
 }
 
 
@@ -838,6 +847,17 @@ async def call_app_api(tool_context: ToolContext, script: str, params: dict[str,
     - ai_documents/list {doc_type, status, asset_type, unit, search, limit, offset}, ai_documents/get {id}.
     - simulation/listjobs {status, origin, limit, offset}, simulation/getjob {job_id},
       simulation/getevents {job_id, variant, kinds, asset, limit, offset}, simulation/getfaultcatalog {}.
+    - production/getoverview {hours} - FAB1 OEE and losses, starts / outs, cycle time per product, WIP by area / layer,
+      overhead transport (transfers, mean delivery minutes, OHT busy %).
+    - production/gettools {hours} - each production tool: status, OEE factors, current lot, queue, throughput.
+    - production/gettrend {days, bucket: day|shift, tool_type, equipment_id} - daily OEE, outs, starts, cycle time, WIP.
+    - production/gettimeline {hours, equipment_ids: "1,2"} - tool status intervals and runs.
+    - production/getlots {status: wip|hold|done|all, search, product_code, area, page, limit} - lots.
+    - production/getlot {lot_code} - one lot: route, step history, measurements, scrap, where its FOUP is
+      (location: a load port TOOL:n, a stocker STK-0n or inside a batch tool) and its overhead transfers.
+    - production/getqualitykeys {hours} - measured characteristics with Cpk and fails.
+    - production/getquality {char_key, hours, equipment_id} - one characteristic: SPC, Cpk by chamber, scrap, FPY.
+    - production/getplanning {} - the current production plan, products and tools.
 
     Args:
       script: One of the scripts above.
