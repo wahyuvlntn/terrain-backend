@@ -45,7 +45,7 @@ HIDDEN_TOOLS = frozenset({"transfer_to_agent"})
 SEARCH_TOOLS = frozenset({"search_documents"})
 # call_app_api scripts whose result carries a stored, cited maintenance instruction
 INSTRUCTION_SCRIPTS = frozenset({"ai_insights/getfault"})
-PROPOSE_TOOLS = frozenset({"propose_simulation"})
+PROPOSE_TOOLS = frozenset({"propose_simulation", "propose_production_plan"})
 NAVIGATE_TOOLS = frozenset({"open_in_app"})
 
 _SENSITIVE_KEY = re.compile(r"token|session|secret|password|passwd|authori[sz]ation|cookie|api[_-]?key|credential", re.I)
