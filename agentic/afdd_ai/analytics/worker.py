@@ -44,7 +44,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..common import backend, db
+from ..common import backend, db, leases
 from ..common.aio import run as aio_run
 from ..common.config import get_settings
 from ..common.log import setup_logging
@@ -261,6 +261,8 @@ class Worker:
             except (NotImplementedError, RuntimeError, ValueError):
                 pass  # Windows: Ctrl+C cancels the main task instead
 
+    lease_lost = False
+
     def request_stop(self, reason: str = "") -> None:
         if not self.stop.is_set():
             log.info("stopping (%s)", reason or "requested")
@@ -270,6 +272,13 @@ class Worker:
 
     async def run(self) -> None:
         self._install_signals()
+        # one active instance (a Cloud Run replacement overlaps the old one): wait for the lease
+        lease = None
+        if os.environ.get("AI_WORKER_LEASE", "true").strip().lower() not in ("0", "false", "no"):
+            lease = await leases.acquire(leases.ANALYTICS_WORKER, "analytics-worker", self.stop)
+            if lease is None:
+                return  # stopped while standing by
+            asyncio.create_task(self._watch_lease(lease), name="lease")
         await db.get_pool(min_size=1, max_size=6)
         log.info("ai-analytics starting site=%s tasks=%s", self.site, ",".join(self.tasks))
         try:
@@ -290,7 +299,14 @@ class Worker:
         await asyncio.gather(*pending, listener, return_exceptions=True)
         await backend.close_client()
         await db.close_pools()
+        if lease is not None:
+            await lease.release()
         log.info("ai-analytics stopped")
+
+    async def _watch_lease(self, lease: leases.Lease) -> None:
+        await lease.lost.wait()
+        self.lease_lost = True
+        self.request_stop("analytics lease lost")
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +381,12 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     if args.once:
         return aio_run(_cli(args))
+    w = Worker(args.site)
     try:
-        aio_run(Worker(args.site).run())
+        aio_run(w.run())
     except KeyboardInterrupt:
         pass
-    return 0
+    return 1 if w.lease_lost else 0  # a lost lease restarts the instance
 
 
 if __name__ == "__main__":

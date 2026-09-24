@@ -91,6 +91,7 @@ async def test_notify_wakes_the_listening_tasks(monkeypatch):
 @pytest.mark.usefixtures("live_db")
 async def test_service_starts_listens_and_stops_gracefully(monkeypatch):
     monkeypatch.setenv("AI_ANALYTICS_TASKS", "expiry")
+    monkeypatch.setenv("AI_WORKER_LEASE", "false")  # the running ai-analytics container holds the lease
     w = worker.Worker()
     ticks: list[float] = []
 
