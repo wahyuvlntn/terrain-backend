@@ -53,7 +53,8 @@ async def get_pool(ro: bool = False, *, min_size: int = 1, max_size: int = 5) ->
                 open=False,
                 name=f"afdd-{key}",
             )
-            await pool.open(wait=True, timeout=60)
+            # a Cloud Run instance's private network path can take a while after a cold start
+            await pool.open(wait=True, timeout=s.db_connect_timeout_s)
             _pools[key] = pool
         return pool
 

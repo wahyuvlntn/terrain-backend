@@ -29,6 +29,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://afdd_ai:afdd-ai-dev@127.0.0.
 os.environ.setdefault("DATABASE_URL_RO", "postgresql://afdd_ai_ro:afdd-ai-ro-dev@127.0.0.1:5432/afdd")
 os.environ.setdefault("AFDD_API_URL", "https://localhost:4500")
 os.environ.setdefault("MINIO_ENDPOINT", "127.0.0.1:9000")
+# The running ai-analytics container holds the analytics worker lease; worker tests run without it.
+os.environ.setdefault("AI_WORKER_LEASE", "false")
 
 if sys.platform == "win32":
     # psycopg async needs a selector loop on Windows.

@@ -72,7 +72,11 @@ class Settings:
     thinking_budget_fast: int
     thinking_budget_pro: int
 
-    # MinIO: private bucket for RAG documents (never served from /public).
+    # Private bucket for RAG documents (never served from /public): MinIO, or
+    # Google Cloud Storage with STORAGE_PROVIDER=gcs (GCS_DOCS_BUCKET; an
+    # emulator at STORAGE_EMULATOR_HOST for tests).
+    storage_provider: str
+    gcs_endpoint: str
     minio_endpoint: str
     minio_access_key: str
     minio_secret_key: str
@@ -93,6 +97,10 @@ class Settings:
     mcp_twin_url: str
     mcp_db_port: int
     mcp_twin_port: int
+    # Private Cloud Run MCP services: send a Google ID token (X-Serverless-Authorization).
+    mcp_id_token: bool
+    # How long start-up waits for the database (a Cloud Run instance's VPC path).
+    db_connect_timeout_s: float
 
     log_level: str
 
@@ -101,15 +109,29 @@ class Settings:
         return bool(self.google_api_key)
 
 
+def asyncpg_url(url: str) -> str:
+    """The SQLAlchemy/asyncpg form of a libpq URL: driver prefix, and asyncpg's `ssl` for libpq's `sslmode`."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    scheme = "postgresql+asyncpg" if parts.scheme in ("postgresql", "postgres") else parts.scheme
+    query = []
+    for k, v in parse_qsl(parts.query, keep_blank_values=True):
+        if k == "sslmode":
+            k = "ssl"
+        elif k in ("pool_max_conns", "pool_min_conns"):
+            continue
+        query.append((k, v))
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     db = _env("DATABASE_URL", "postgresql://afdd_ai:afdd-ai-dev@postgres:5432/afdd")
     return Settings(
         database_url=db,
         database_url_ro=_env("DATABASE_URL_RO", db),
-        agent_session_db_url=_env(
-            "AGENT_SESSION_DB_URL", db.replace("postgresql://", "postgresql+asyncpg://", 1).replace("postgres://", "postgresql+asyncpg://", 1)
-        ),
+        agent_session_db_url=_env("AGENT_SESSION_DB_URL", asyncpg_url(db)),
         api_url=_env("AFDD_API_URL", "https://backend:4500").rstrip("/"),
         org_alias=_env("ORG_ALIAS", "local"),
         project_alias=_env("PROJECT_ALIAS", "digital_twin_afdd"),
@@ -131,11 +153,13 @@ def get_settings() -> Settings:
         thinking_budget_root=_env_int("AI_THINKING_BUDGET_ROOT", 0),
         thinking_budget_fast=_env_int("AI_THINKING_BUDGET_FAST", 512),
         thinking_budget_pro=_env_int("AI_THINKING_BUDGET_PRO", 1024),
+        storage_provider=_env("STORAGE_PROVIDER", "minio").lower(),
+        gcs_endpoint=_env("STORAGE_EMULATOR_HOST", ""),
         minio_endpoint=_env("MINIO_ENDPOINT", "minio:9000"),
         minio_access_key=_env("MINIO_ACCESS_KEY", "afddminio"),
         minio_secret_key=_env("MINIO_SECRET_KEY", "afddminio-secret"),
         minio_secure=_env_bool("MINIO_USE_SSL", False),
-        docs_bucket=_env("MINIO_DOCS_BUCKET", "afdd-docs"),
+        docs_bucket=_env("GCS_DOCS_BUCKET", "") if _env("STORAGE_PROVIDER", "minio").lower() == "gcs" else _env("MINIO_DOCS_BUCKET", "afdd-docs"),
         site_code=_env("SITE_CODE", "SGF1"),
         timezone=_env("DEFAULT_TIMEZONE", "Asia/Singapore"),
         anomaly_interval_s=_env_int("ANOMALY_INTERVAL_S", 60),
@@ -145,5 +169,7 @@ def get_settings() -> Settings:
         mcp_twin_url=_env("MCP_TWIN_URL", "http://ai-mcp:8102/mcp"),
         mcp_db_port=_env_int("MCP_DB_PORT", 8101),
         mcp_twin_port=_env_int("MCP_TWIN_PORT", 8102),
+        mcp_id_token=_env_bool("MCP_ID_TOKEN", False),
+        db_connect_timeout_s=_env_float("DB_CONNECT_TIMEOUT_S", 60.0),
         log_level=_env("LOG_LEVEL", "INFO").upper(),
     )
