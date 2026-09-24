@@ -11,7 +11,8 @@ statistics.
 Times returned to the model are plant-local ISO strings with offset.
 
 Tools: get_plant_state, get_fault_catalog, get_forecast_conditions,
-propose_simulation, get_simulation_status, get_simulation_results,
+propose_simulation, propose_production_plan, get_production_planning_options, get_simulation_status,
+get_simulation_results,
 list_simulations, get_latest_recommendation.
 """
 
@@ -378,6 +379,122 @@ async def propose_simulation(ctx: Context, title: str, rationale: str, spec: dic
     }
 
 
+PLAN_KEYS = {"starts_per_day", "mix", "hot_share", "dispatch", "furnace_wait_h", "furnace_min_lots", "vehicles"}
+
+
+def _validate_plan_spec(spec: Any) -> dict[str, Any]:
+    """Light checks of a production plan spec (the backend validates it fully against the tools)."""
+    if not isinstance(spec, Mapping):
+        raise ToolError("spec must be an object")
+    if len(json.dumps(spec, default=str)) > 20000:
+        raise ToolError("spec is too large")
+    out = dict(spec)
+    kind = out.pop("kind", "production")
+    if kind != "production":
+        raise ToolError("A production plan has kind production")
+    horizon = out.get("horizon_days")
+    if not isinstance(horizon, (int, float)) or not 1 <= horizon <= 90:
+        raise ToolError("spec.horizon_days must be a number from 1 to 90")
+    variants = out.get("variants") or []
+    if not isinstance(variants, list) or not 1 <= len(variants) <= 3:
+        raise ToolError("spec.variants must be a list of 1 to 3 variants (the first one is the baseline)")
+    for v in variants:
+        if not isinstance(v, Mapping) or not str(v.get("name") or "").strip():
+            raise ToolError("Each variant needs a name")
+        plan = v.get("plan") or {}
+        if not isinstance(plan, Mapping) or not set(plan) <= PLAN_KEYS:
+            raise ToolError(f"A variant plan takes only {', '.join(sorted(PLAN_KEYS))}")
+        for a in v.get("actions") or []:
+            if not isinstance(a, Mapping) or a.get("kind") not in ("tool_down", "add_tool") or not a.get("asset"):
+                raise ToolError("Each action is a tool_down or add_tool with an asset (tool alias)")
+    out["kind"] = "production"
+    return out
+
+
+@mcp.tool()
+async def get_production_planning_options(ctx: Context) -> dict[str, Any]:
+    """The FAB1 production plan in effect (lot starts per day, hot lot share, dispatch rule, furnace batching),
+    the products with their mix, mask count and planned cycle time, and the production tools by area, for
+    building a production plan."""
+    user = await current_user(ctx)
+    return jsonable(await _call(user, "production/getplanning", {}, "the production planning options") or {}, 3)
+
+
+@mcp.tool()
+async def propose_production_plan(ctx: Context, title: str, rationale: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Propose a FAB1 production planning simulation: the production model of a copy of the fab is run ahead
+    under up to three plans (lot starts, product mix, hot lots, dispatch rule, furnace batching, planned tool
+    downs, additional tools). It is created as PROPOSED and runs only after a person approves it; it has not run
+    when this returns.
+
+    Args:
+      title: Short title, e.g. "5 lot starts a day with a second KrF scanner".
+      rationale: Why this plan, citing the evidence (production KPIs, bottleneck, tool states).
+      spec: {"horizon_days", "initial": "live" | "nominal", "breakdowns", "seed", "variants": [{"name", "plan", "actions"}]}.
+    """
+    user = await current_user(ctx)
+    t = (title or "").strip()
+    r = (rationale or "").strip()
+    if not 3 <= len(t) <= 200:
+        raise ToolError("title must be 3-200 characters")
+    if not r:
+        raise ToolError("A rationale is required")
+    clean = _validate_plan_spec(spec)
+    body: dict[str, Any] = {"title": t, "rationale": r[:4000], "spec": clean}
+    if (sid := agent_session_id(ctx)) is not None:
+        body["agent_session_id"] = sid
+    job = await _call(user, "production/proposeplan", body, "proposing a production plan") or {}
+    status = job.get("status") or "PROPOSED"
+    return {
+        "job_id": job.get("id"),
+        "title": job.get("title") or t,
+        "status": status,
+        "approval_required": status == "PROPOSED",
+        "variants": [v.get("name") for v in clean.get("variants", [])],
+        "horizon_days": clean.get("horizon_days"),
+        "rationale": job.get("rationale") or r[:4000],
+        "spec_summary": summarise_plan(clean),
+        "message": "Proposed. A person must approve it in the application before it runs; it has not run.",
+    }
+
+
+def summarise_plan(spec: Mapping[str, Any]) -> str:
+    """One-line human summary of a production plan (for the approval card)."""
+    parts = []
+    for v in spec.get("variants") or []:
+        plan = v.get("plan") or {}
+        bits = []
+        if plan.get("starts_per_day") is not None:
+            bits.append(f"{plan['starts_per_day']} starts/day")
+        if plan.get("mix"):
+            bits.append("mix " + ", ".join(f"{k} {round(100 * float(x))} %" for k, x in plan["mix"].items()))
+        if plan.get("dispatch"):
+            bits.append(str(plan["dispatch"]))
+        for a in v.get("actions") or []:
+            if a.get("kind") == "tool_down":
+                bits.append(f"{a.get('asset')} down day {a.get('at_day', 0)} for {a.get('duration_h')} h")
+            elif a.get("kind") == "add_tool":
+                bits.append(f"+{a.get('count', 1)} {a.get('asset')}")
+        parts.append(f"{v.get('name')}: {', '.join(bits) or 'current plan'}")
+    return f"Production plan, {spec.get('horizon_days')} days; " + "; ".join(parts)
+
+
+def _compact_plan_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """A production plan summary without the daily series and the full tool lists (tokens)."""
+    out = {k: v for k, v in summary.items() if k != "variants"}
+    variants = {}
+    for name, v in (summary.get("variants") or {}).items():
+        if not isinstance(v, Mapping):
+            continue
+        kpi = dict(v.get("kpi") or {})
+        util = kpi.pop("util", {}) or {}
+        kpi["busiest_tools"] = dict(sorted(util.items(), key=lambda x: -float(x[1] or 0))[:6])
+        variants[name] = {"plan": v.get("plan"), "kpi": kpi, "wip_start": v.get("wip_start"),
+                          "planned_events": [e for e in v.get("events") or [] if isinstance(e, Mapping) and e.get("kind") in ("planned", "added")]}
+    out["variants"] = variants
+    return out
+
+
 @mcp.tool()
 async def get_simulation_status(ctx: Context, job_id: int) -> dict[str, Any]:
     """Status of a simulation job (PROPOSED, QUEUED, RUNNING, ANALYZING, SUCCEEDED, FAILED, REJECTED,
@@ -409,6 +526,9 @@ async def get_simulation_results(ctx: Context, job_id: int, events_limit: int = 
         out["note"] = f"No results: the job is {status or 'unknown'} ({STATUS_MEANING.get(status, '')})."
         if status == "ANALYZING":
             out["partial_summary"] = jsonable(job.get("summary") or {}, 3)
+        return out
+    if job.get("kind") == "production":
+        out["summary"] = jsonable(_compact_plan_summary(job.get("summary") or {}), 3)
         return out
     out["summary"] = jsonable(job.get("summary") or {}, 3)
     try:

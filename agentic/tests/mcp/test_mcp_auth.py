@@ -70,6 +70,8 @@ async def test_valid_session_lists_tools(servers, fake_backend):
         "get_fault_catalog",
         "get_forecast_conditions",
         "propose_simulation",
+        "propose_production_plan",
+        "get_production_planning_options",
         "get_simulation_status",
         "get_simulation_results",
         "list_simulations",
