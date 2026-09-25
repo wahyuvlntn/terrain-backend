@@ -271,6 +271,10 @@ async def process_job(job_id: int) -> str | None:
     if job is None or job["status"] != "ANALYZING":
         return None
     summary = dict(job["summary"] or {})
+    if job["kind"] == "production":
+        # production plans are analysed by the simulator (it normally completes them itself)
+        await _finish(job_id, "SUCCEEDED", summary)
+        return "SUCCEEDED"
     if job["kind"] == "doe":
         n = int(await db.fetch_val("SELECT count(*) FROM sim.doe_samples WHERE job_id = %s", (job_id,)) or 0)
         summary |= {"samples": n, "success": n > 0, "reason": f"{n} DOE samples" if n else "the DOE produced no samples"}
