@@ -28,7 +28,6 @@ from datetime import timedelta
 from typing import Any
 
 import numpy as np
-from minio.error import S3Error
 
 from ..common import db, gemini, storage
 from ..common.config import get_settings
@@ -111,7 +110,7 @@ async def ingest(doc: dict[str, Any]) -> int:
     doc_id = int(doc["id"])
     try:
         blob = await storage.get_bytes(doc["object_key"])
-    except S3Error as err:
+    except storage.ObjectNotFound as err:
         await _fail(doc_id, f"original not found in the document store ({err.code})")
         return 0
     try:
