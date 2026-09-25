@@ -30,3 +30,6 @@ bin
 *.exe
 .idea
 .vscode
+
+# local cloud-like test stack (compose files, throwaway TLS key)
+deploy
