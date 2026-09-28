@@ -411,6 +411,10 @@ func (s *Server) serveLogout(w http.ResponseWriter, r *http.Request) {
 // POST /api/datahub/rest/{gateway_alias} with a JSON body, authenticated with
 // the gateway's API key (header X-Api-Key or ?api_key=).
 func (s *Server) serveRestIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/commands") {
+		s.serveRestCommands(w, r, strings.TrimSuffix(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/datahub/rest/"), "/"), "/commands"))
+		return
+	}
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		httpx.WriteError(w, r, &httpx.Error{Status: http.StatusMethodNotAllowed, Msg: "Method not allowed"})
 		return
