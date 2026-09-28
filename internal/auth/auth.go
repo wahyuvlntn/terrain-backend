@@ -412,6 +412,9 @@ func (s *Service) EnsureBootstrapUser(ctx context.Context, username, password st
 	_, err = s.db.Exec(ctx, `INSERT INTO core.users (username, password_hash, full_name, role)
 		VALUES ($1, $2, 'Super User', 'superuser')`, username, hash)
 	if err != nil {
+		if db.IsUniqueViolation(err) {
+			return false, "", nil // another instance created it at the same time
+		}
 		return false, "", fmt.Errorf("create bootstrap superuser: %w", err)
 	}
 	return true, generated, nil
