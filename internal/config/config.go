@@ -33,6 +33,27 @@ type Config struct {
 
 	// Database
 	DatabaseURL string
+	// How long start-up keeps retrying the first database connection (a
+	// Cloud Run instance's VPC path can take a while after a cold start).
+	DBConnectTimeout time.Duration
+
+	// Start-up administration, nil = the role's default (`serve`: on; `api` /
+	// `worker`: off, a provisioning job does it): apply migrations, enable the
+	// AI service roles' logins, create / drop ts.parameter_values partitions.
+	RuntimeMigrations    *bool
+	EnsureServiceRoles   *bool
+	PartitionMaintenance *bool
+	// Shared live state (`api` / `worker`): how often the worker writes the
+	// latest tag values and an API replica reads them.
+	LiveFlushInterval   time.Duration
+	LiveRefreshInterval time.Duration
+
+	// Object storage provider: "minio" (S3 compatible, default) or "gcs"
+	// (Google Cloud Storage with the attached service account).
+	StorageProvider string
+	GCSAssetsBucket string
+	GCSDocsBucket   string
+	GCSEndpoint     string // STORAGE_EMULATOR_HOST: a GCS emulator (tests), unauthenticated
 
 	// Object storage (MinIO / S3)
 	MinioEndpoint  string
@@ -48,6 +69,10 @@ type Config struct {
 	// Agentic AI services (docs/agentic/DESIGN.md)
 	AgentURL    string // ai-agent base URL proxied under /api/agent/ (empty = assistant disabled)
 	AgentSecret string // shared secret sent to the AI services as X-Agent-Secret
+	// Send a Google ID token (X-Serverless-Authorization) to the agent: a
+	// private Cloud Run service. The audience defaults to the agent's root URL.
+	AgentIDToken         bool
+	AgentIDTokenAudience string
 	// Login passwords of the database roles afdd_ai / afdd_ai_ro, set at
 	// start-up when not empty (the roles are NOLOGIN until then).
 	AIDBPassword   string
@@ -103,7 +128,19 @@ func Load() (*Config, error) {
 		CORSOrigins:       splitList(env("CORS_ORIGINS", "")),
 		StaticDir:         env("STATIC_DIR", ""),
 
-		DatabaseURL: env("DATABASE_URL", "postgres://afdd:afdd@localhost:5432/afdd?sslmode=disable"),
+		DatabaseURL:      env("DATABASE_URL", "postgres://afdd:afdd@localhost:5432/afdd?sslmode=disable"),
+		DBConnectTimeout: envDuration("DB_CONNECT_TIMEOUT", 60*time.Second),
+
+		RuntimeMigrations:    envOptBool("RUNTIME_MIGRATIONS"),
+		EnsureServiceRoles:   envOptBool("ENSURE_SERVICE_ROLES"),
+		PartitionMaintenance: envOptBool("PARTITION_MAINTENANCE"),
+		LiveFlushInterval:    envDuration("LIVE_FLUSH_INTERVAL", time.Second),
+		LiveRefreshInterval:  envDuration("LIVE_REFRESH_INTERVAL", time.Second),
+
+		StorageProvider: strings.ToLower(env("STORAGE_PROVIDER", "minio")),
+		GCSAssetsBucket: env("GCS_ASSETS_BUCKET", ""),
+		GCSDocsBucket:   env("GCS_DOCS_BUCKET", ""),
+		GCSEndpoint:     env("STORAGE_EMULATOR_HOST", ""),
 
 		MinioEndpoint:  env("MINIO_ENDPOINT", "localhost:9000"),
 		MinioAccessKey: env("MINIO_ACCESS_KEY", "minioadmin"),
@@ -113,10 +150,12 @@ func Load() (*Config, error) {
 		MinioRegion:    env("MINIO_REGION", ""),
 		DocsBucket:     env("MINIO_DOCS_BUCKET", "afdd-docs"),
 
-		AgentURL:       strings.TrimRight(env("AGENT_URL", "http://ai-agent:8000"), "/"),
-		AgentSecret:    env("AGENT_SHARED_SECRET", ""),
-		AIDBPassword:   env("AI_DB_PASSWORD", ""),
-		AIDBROPassword: env("AI_DB_RO_PASSWORD", ""),
+		AgentURL:             strings.TrimRight(env("AGENT_URL", "http://ai-agent:8000"), "/"),
+		AgentSecret:          env("AGENT_SHARED_SECRET", ""),
+		AgentIDToken:         envBool("AGENT_ID_TOKEN", false),
+		AgentIDTokenAudience: env("AGENT_ID_TOKEN_AUDIENCE", ""),
+		AIDBPassword:         env("AI_DB_PASSWORD", ""),
+		AIDBROPassword:       env("AI_DB_RO_PASSWORD", ""),
 
 		MQTTEnabled:        envBool("MQTT_ENABLED", true),
 		MQTTTCPAddr:        env("MQTT_TCP_ADDR", ":1883"),
@@ -163,8 +202,27 @@ func Load() (*Config, error) {
 	if c.DocsBucket == "" {
 		c.DocsBucket = "afdd-docs"
 	}
-	if c.DocsBucket == c.MinioBucket {
-		return nil, fmt.Errorf("MINIO_DOCS_BUCKET must differ from MINIO_BUCKET (%q is served publicly under /public)", c.MinioBucket)
+	switch c.StorageProvider {
+	case "minio", "":
+		c.StorageProvider = "minio"
+		if c.DocsBucket == c.MinioBucket {
+			return nil, fmt.Errorf("MINIO_DOCS_BUCKET must differ from MINIO_BUCKET (%q is served publicly under /public)", c.MinioBucket)
+		}
+	case "gcs":
+		if c.GCSAssetsBucket == "" || c.GCSDocsBucket == "" {
+			return nil, fmt.Errorf("STORAGE_PROVIDER=gcs needs GCS_ASSETS_BUCKET and GCS_DOCS_BUCKET")
+		}
+		if c.GCSAssetsBucket == c.GCSDocsBucket {
+			return nil, fmt.Errorf("GCS_DOCS_BUCKET must differ from GCS_ASSETS_BUCKET (%q is served under /public)", c.GCSAssetsBucket)
+		}
+	default:
+		return nil, fmt.Errorf("STORAGE_PROVIDER must be minio or gcs, got %q", c.StorageProvider)
+	}
+	if c.LiveFlushInterval < 200*time.Millisecond {
+		c.LiveFlushInterval = 200 * time.Millisecond
+	}
+	if c.LiveRefreshInterval < 200*time.Millisecond {
+		c.LiveRefreshInterval = 200 * time.Millisecond
 	}
 	if c.AgentURL != "" {
 		if u, err := url.Parse(c.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -179,6 +237,27 @@ func env(key, def string) string {
 		return strings.TrimSpace(v)
 	}
 	return def
+}
+
+// envOptBool is a boolean that is nil when unset (the caller's default).
+func envOptBool(key string) *bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return nil
+	}
+	return &b
+}
+
+// Or returns *b, or def when b is nil.
+func Or(b *bool, def bool) bool {
+	if b == nil {
+		return def
+	}
+	return *b
 }
 
 func envBool(key string, def bool) bool {
