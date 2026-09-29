@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"afdd/internal/broker"
 	"afdd/internal/datahub"
 	"afdd/internal/db"
 	"afdd/internal/httpx"
@@ -158,16 +157,12 @@ func (s *Server) twinWrite(c *Ctx, epid int64, value float64) (map[string]any, e
 	if i := strings.LastIndex(key, "/"); i >= 0 {
 		device, key = key[:i], key[i+1:]
 	}
-	topic := broker.CommandTopic(s.Hub.MQTTIdentity(*p.Gateway), device)
-	if device == "" {
-		topic = strings.TrimSuffix(topic, "/")
-	}
 	// expires_at (ms): the device drops a command it receives after the backend
 	// stopped waiting, so a request reported TIMEOUT never changes the plant later
 	sent := time.Now()
 	payload, _ := json.Marshal(map[string]any{"request_id": id, "parameter": key, "value": value, "user": c.User.Username,
 		"expires_at": sent.Add(twinControlWait).UnixMilli()})
-	if err := s.Broker.Publish(topic, payload); err != nil {
+	if err := s.sendCommand(bg, *p.Gateway, gwType, device, payload, sent.Add(twinControlWait)); err != nil {
 		s.twinCompleteRequest(bg, id, "REJECTED", "Could not send the command: "+err.Error())
 		return s.twinControlRequest(bg, id)
 	}
@@ -201,7 +196,7 @@ func (s *Server) twinValidateWrite(c *Ctx, p *epInfo, ctl *twinControl, controls
 	switch {
 	case p.Gateway == nil || p.Tag == nil:
 		return "The parameter is not mapped to a data source tag"
-	case gwType != datahub.MQTTServer:
+	case !s.acceptsCommands(gwType):
 		return "The data source of this parameter does not accept commands"
 	}
 	if st := s.Hub.Status(*p.Gateway); !st.Active || !st.Connected {
