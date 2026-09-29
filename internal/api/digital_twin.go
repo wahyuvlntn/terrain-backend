@@ -22,6 +22,7 @@ func (s *Server) registerDigitalTwin() {
 	s.handle("digital_twin/getparametertrend", AccessUser, s.twinParameterTrend)
 	s.handle("digital_twin/getassetsummary", AccessUser, s.twinAssetSummary)
 	s.handle("digital_twin/getliveoverview", AccessUser, s.twinLiveOverview)
+	s.handle("digital_twin/getamhs", AccessUser, s.twinAMHS)
 }
 
 // twinAssets lists every visible equipment with its alias and current state.
