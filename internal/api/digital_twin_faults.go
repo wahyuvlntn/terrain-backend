@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"afdd/internal/broker"
 	"afdd/internal/datahub"
 	"afdd/internal/db"
 	"afdd/internal/httpx"
@@ -174,15 +173,15 @@ func (s *Server) twinInjectFault(c *Ctx) (any, error) {
 		value = v
 	}
 
-	gateway, device, err := s.equipmentCommandTarget(c, assetID)
+	gateway, gwType, device, err := s.equipmentCommandTarget(c, assetID)
 	if err != nil {
 		return nil, err
 	}
 	requestID := commandRequestID()
+	expires := time.Now().Add(twinControlWait)
 	payload, _ := json.Marshal(map[string]any{"request_id": requestID, "fault": f.Kind, "value": value, "action": action,
-		"user": c.User.Username, "expires_at": time.Now().Add(twinControlWait).UnixMilli()})
-	topic := broker.CommandTopic(s.Hub.MQTTIdentity(gateway), device)
-	if err := s.Broker.Publish(topic, payload); err != nil {
+		"user": c.User.Username, "expires_at": expires.UnixMilli()})
+	if err := s.sendCommand(c, gateway, gwType, device, payload, expires); err != nil {
 		return nil, &httpx.Error{Status: 502, Msg: "Could not send the command to the plant", Err: err}
 	}
 	slog.Info("fault command sent", "equipment", canonical, "fault", f.Kind, "value", value, "action", action,
@@ -191,15 +190,15 @@ func (s *Server) twinInjectFault(c *Ctx) (any, error) {
 		"action": action}, nil
 }
 
-// equipmentCommandTarget returns the MQTT_SERVER gateway and the device name
-// of an equipment's command topic, taken from its mapped tags
+// equipmentCommandTarget returns the gateway (alias and type) and the device
+// name an equipment takes commands on, taken from its mapped tags
 // ("<device>/<key>"), after checking that the equipment is reporting.
-func (s *Server) equipmentCommandTarget(ctx context.Context, assetID int64) (gateway, device string, err error) {
+func (s *Server) equipmentCommandTarget(ctx context.Context, assetID int64) (gateway, gwType, device string, err error) {
 	rows, err := s.DB.Query(ctx, `SELECT g.alias, g.type, ep.tag_name FROM asset.equipment_parameters ep
 		JOIN dh.gateways g ON g.id = ep.gateway_id
 		WHERE ep.equipment_id = $1 AND ep.tag_name IS NOT NULL AND ep.tag_name LIKE '%/%' ORDER BY ep.id`, assetID)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer rows.Close()
 	type tag struct{ gateway, typ, name string }
@@ -207,22 +206,22 @@ func (s *Server) equipmentCommandTarget(ctx context.Context, assetID int64) (gat
 	for rows.Next() {
 		var t tag
 		if err := rows.Scan(&t.gateway, &t.typ, &t.name); err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 		tags = append(tags, t)
 	}
 	if err := rows.Err(); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if len(tags) == 0 {
-		return "", "", httpx.BadRequest("The equipment is not mapped to a data source")
+		return "", "", "", httpx.BadRequest("The equipment is not mapped to a data source")
 	}
 	t := tags[0]
-	if t.typ != datahub.MQTTServer {
-		return "", "", httpx.BadRequest("The data source of this equipment does not accept commands")
+	if !s.acceptsCommands(t.typ) {
+		return "", "", "", httpx.BadRequest("The data source of this equipment does not accept commands")
 	}
 	if st := s.Hub.Status(t.gateway); !st.Active || !st.Connected {
-		return "", "", httpx.BadRequestf("Data source %s is not connected", t.gateway)
+		return "", "", "", httpx.BadRequestf("Data source %s is not connected", t.gateway)
 	}
 	// The equipment must be reporting, otherwise it would not take the command.
 	fresh := false
@@ -237,9 +236,9 @@ func (s *Server) equipmentCommandTarget(ctx context.Context, assetID int64) (gat
 		}
 	}
 	if !fresh {
-		return "", "", httpx.BadRequest("No live data from the equipment")
+		return "", "", "", httpx.BadRequest("No live data from the equipment")
 	}
-	return t.gateway, t.name[:strings.LastIndex(t.name, "/")], nil
+	return t.gateway, t.typ, t.name[:strings.LastIndex(t.name, "/")], nil
 }
 
 // commandRequestID returns a positive random id that tags a command in the
