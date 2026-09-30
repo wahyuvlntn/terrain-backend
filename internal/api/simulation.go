@@ -984,8 +984,12 @@ func (s *Server) simGetJob(c *Ctx) (any, error) {
 	return row, nil
 }
 
-// simNewJob is a job to insert.
+// simNewJob is a job to insert: a scenario (Spec) or another kind with its
+// validated spec as JSON (Raw).
 type simNewJob struct {
+	Kind         string
+	Raw          json.RawMessage
+	StepS        int
 	Title        string
 	Spec         *simSpec
 	Rationale    *string
@@ -997,12 +1001,22 @@ type simNewJob struct {
 // simCreateJob inserts a job after the per-user limits (serialised per user
 // with a transaction-scoped advisory lock) and notifies sim_jobs.
 func (s *Server) simCreateJob(c *Ctx, nj simNewJob) (int64, error) {
-	spec, err := json.Marshal(nj.Spec)
-	if err != nil {
-		return 0, err
+	kind, stepS := "scenario", simStepS
+	if nj.Kind != "" {
+		kind = nj.Kind
+	}
+	if nj.StepS > 0 {
+		stepS = nj.StepS
+	}
+	spec := []byte(nj.Raw)
+	var err error
+	if nj.Raw == nil {
+		if spec, err = json.Marshal(nj.Spec); err != nil {
+			return 0, err
+		}
 	}
 	var simStart, simEnd *time.Time
-	if nj.Spec.Start != nil {
+	if nj.Spec != nil && nj.Spec.Start != nil {
 		if t, err := time.Parse(time.RFC3339Nano, *nj.Spec.Start); err == nil {
 			end := t.Add(time.Duration(nj.Spec.DurationMin) * time.Minute)
 			simStart, simEnd = &t, &end
@@ -1031,8 +1045,8 @@ func (s *Server) simCreateJob(c *Ctx, nj simNewJob) (int64, error) {
 			}
 		}
 		if err := tx.QueryRow(c, `INSERT INTO sim.jobs (kind, title, origin, status, spec, rationale, requested_by, agent_session_id,
-				sim_start, sim_end, step_s) VALUES ('scenario', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-			nj.Title, nj.Origin, nj.Status, spec, nj.Rationale, c.User.ID, nj.AgentSession, simStart, simEnd, simStepS).Scan(&id); err != nil {
+				sim_start, sim_end, step_s) VALUES ($11, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+			nj.Title, nj.Origin, nj.Status, spec, nj.Rationale, c.User.ID, nj.AgentSession, simStart, simEnd, stepS, kind).Scan(&id); err != nil {
 			return err
 		}
 		return simNotify(c, tx, id)
