@@ -27,4 +27,5 @@ func (s *Server) registerAll() {
 	s.registerSimulation()
 	s.registerAIInsights()
 	s.registerAIDocuments()
+	s.registerProduction()
 }
