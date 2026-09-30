@@ -854,8 +854,9 @@ func (s *Server) loDirectChildren(c *Ctx) (any, error) {
 }
 
 // locationAPQ computes availability / uptime of the equipment below a
-// location over a period. Performance and quality are not measured by this
-// product and are reported as null.
+// location over a period. Performance and quality are the rate and quality
+// efficiency of the process tools below the location (production records);
+// null where there are none.
 func (s *Server) locationAPQ(c *Ctx, tree *locTree, locID *int64, from, to time.Time) (map[string]any, error) {
 	scope, err := c.Scope()
 	if err != nil {
@@ -907,10 +908,11 @@ func (s *Server) locationAPQ(c *Ctx, tree *locTree, locID *int64, from, to time.
 	if locID != nil {
 		_ = s.DB.QueryRow(c, `SELECT availability_th, performance_th, quality_th FROM asset.locations WHERE id = $1`, *locID).Scan(&availTh, &perfTh, &qualTh)
 	}
+	perf, quality := s.toolPerfQuality(c, assets, from, to)
 	return map[string]any{
-		"totalAvailability": availability, "totalUptime": uptime, "totalPerformance": nil, "totalQuality": nil,
+		"totalAvailability": availability, "totalUptime": uptime, "totalPerformance": perf, "totalQuality": quality,
 		"availabilityGood": availability == nil || *availability >= availTh,
-		"performanceGood":  true, "qualityGood": true,
+		"performanceGood":  perf == nil || *perf >= perfTh, "qualityGood": quality == nil || *quality >= qualTh,
 	}, nil
 }
 
@@ -981,10 +983,10 @@ func (s *Server) loExport(c *Ctx) (any, error) {
 		n := tree.nodes[id]
 		out = append(out, map[string]any{
 			"availabilityGood": apq["availabilityGood"], "availabilityTh": a, "hierarchyLevel": tree.depth(id), "id": id,
-			"name": n.Name, "parentId": n.ParentID, "performanceGood": true, "performanceTh": p, "qualityGood": true, "qualityTh": q,
+			"name": n.Name, "parentId": n.ParentID, "performanceGood": apq["performanceGood"], "performanceTh": p, "qualityGood": apq["qualityGood"], "qualityTh": q,
 			"totalAssets": st.total, "totalAvailability": apq["totalAvailability"], "totalCritical": st.critical, "totalIdle": st.idle,
-			"totalNormal": st.normal, "totalOffline": st.offline, "totalPerformance": nil, "totalPlannedDown": st.planned,
-			"totalQuality": nil, "totalRunning": st.running, "totalUnplannedDown": st.unplanned, "totalUptime": apq["totalUptime"],
+			"totalNormal": st.normal, "totalOffline": st.offline, "totalPerformance": apq["totalPerformance"], "totalPlannedDown": st.planned,
+			"totalQuality": apq["totalQuality"], "totalRunning": st.running, "totalUnplannedDown": st.unplanned, "totalUptime": apq["totalUptime"],
 			"totalWarning": st.warning,
 		})
 	}
