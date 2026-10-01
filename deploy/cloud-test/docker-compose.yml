@@ -1,0 +1,193 @@
+# Cloud-like local test stack (separate project "afdd-cloudtest"; the normal
+# docker-compose.yml stack is untouched). It runs the processes the way the
+# GCP deployment does, to validate the Cloud Run readiness checks:
+#   - PostgreSQL with TLS required, login roles and grants like AlloyDB stage
+#     03 / 05 (deployment/gcp/db-tools/sql/grants.sql), migrations as a job
+#   - two stateless API replicas (`afdd api`) behind a round-robin balancer
+#   - two processing workers (`afdd worker`): one holds the lease, one waits
+#   - a GCS emulator for both buckets (STORAGE_PROVIDER=gcs)
+#   - the simulator over HTTPS push (SIM_TRANSPORT=http), no MQTT broker
+#   - the web UI built with VITE_NOTIFY_MODE=poll
+# Usage: see README.md (build the :cloudtest images first).
+name: afdd-cloudtest
+
+x-api-env: &api-env
+  HTTP_ADDR: ":8080"
+  HTTP_TLS: "false"
+  MQTT_ENABLED: "false"
+  ORG_ALIAS: local
+  PROJECT_ALIAS: digital_twin_afdd
+  DEFAULT_TIMEZONE: Asia/Singapore
+  DATA_DIR: /data
+  RETENTION_DAYS: "730"
+  STORAGE_PROVIDER: gcs
+  GCS_ASSETS_BUCKET: dt-assets
+  GCS_DOCS_BUCKET: dt-docs
+  STORAGE_EMULATOR_HOST: gcs:4443
+  DATABASE_URL: postgres://afdd_api:cloudtest-api@db:5432/afdd?sslmode=require&pool_max_conns=10
+  DB_CONNECT_TIMEOUT: 240s
+  BOOTSTRAP_PASSWORD: Cloudtest@2026
+  AGENT_URL: http://agent:8080
+  AGENT_SHARED_SECRET: cloudtest-agent-secret
+  LOG_LEVEL: info
+
+# the AI services (profile "ai"), with the cloud's TLS database URLs and GCS
+x-ai-env: &ai-env
+  ORG_ALIAS: local
+  PROJECT_ALIAS: digital_twin_afdd
+  DEFAULT_TIMEZONE: Asia/Singapore
+  STORAGE_PROVIDER: gcs
+  GCS_ASSETS_BUCKET: dt-assets
+  GCS_DOCS_BUCKET: dt-docs
+  STORAGE_EMULATOR_HOST: gcs:4443
+  AFDD_API_URL: http://lb:8080
+  AFDD_API_VERIFY_TLS: "true"
+  DATABASE_URL: postgresql://afdd_ai:cloudtest-ai@db:5432/afdd?sslmode=require
+  DATABASE_URL_RO: postgresql://afdd_ai_ro:cloudtest-ai-ro@db:5432/afdd?sslmode=require
+  AGENT_SESSION_DB_URL: postgresql+asyncpg://afdd_ai:cloudtest-ai@db:5432/afdd?ssl=require
+  AGENT_SHARED_SECRET: cloudtest-agent-secret
+  AGENT_ALLOWED_HOSTS: agent,localhost,127.0.0.1
+  MCP_ALLOWED_HOSTS: mcp-db,mcp-twin
+  MCP_DB_URL: http://mcp-db:8080/mcp
+  MCP_TWIN_URL: http://mcp-twin:8080/mcp
+  DB_CONNECT_TIMEOUT_S: "240"
+  GOOGLE_API_KEY: ""
+  LOG_LEVEL: INFO
+
+services:
+  db:
+    image: afdd-postgres:16.15-pgvector0.8.6
+    entrypoint: ["/bin/sh", "/ssl-entrypoint.sh"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: cloudtest-admin
+      POSTGRES_DB: afdd
+    volumes:
+      - ./pg-ssl-entrypoint.sh:/ssl-entrypoint.sh:ro
+      - ./tls:/tls:ro
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d afdd"]
+      interval: 3s
+      retries: 40
+
+  gcs:
+    image: fsouza/fake-gcs-server:1.49.3
+    command: ["-scheme", "http", "-port", "4443", "-external-url", "http://gcs:4443", "-backend", "memory"]
+
+  # stage 03: the login roles exist before the migration (0005 keeps them)
+  roles:
+    image: afdd-postgres:16.15-pgvector0.8.6
+    depends_on: { db: { condition: service_healthy } }
+    entrypoint: ["psql", "postgresql://postgres:cloudtest-admin@db:5432/afdd?sslmode=require", "-v", "ON_ERROR_STOP=1", "-f", "/roles.sql"]
+    volumes: ["./roles.sql:/roles.sql:ro"]
+
+  # stage 05: migrations by the provisioning identity, then the grants
+  migrate:
+    image: afdd-backend:cloudtest
+    depends_on: { roles: { condition: service_completed_successfully } }
+    command: ["migrate"]
+    healthcheck: { disable: true }
+    environment:
+      DATABASE_URL: postgres://postgres:cloudtest-admin@db:5432/afdd?sslmode=require
+      DB_CONNECT_TIMEOUT: 240s
+
+  grants:
+    image: afdd-postgres:16.15-pgvector0.8.6
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    entrypoint: ["psql", "postgresql://postgres:cloudtest-admin@db:5432/afdd?sslmode=require", "-f", "/grants.sql"]
+    volumes: ["../../../deployment/gcp/db-tools/sql/grants.sql:/grants.sql:ro"]
+
+  api1: &api
+    image: afdd-backend:cloudtest
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["api"]
+    environment: *api-env
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      retries: 30
+  api2: *api
+
+  worker1: &worker
+    image: afdd-backend:cloudtest
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["worker"]
+    environment: *api-env
+    healthcheck: { disable: true }
+  worker2: *worker
+
+  # the HTTPS load balancer's job: round robin over the API replicas
+  lb:
+    image: digital-twin-afdd-frontend:cloudtest
+    depends_on: [api1, api2]
+    volumes: ["./lb.conf:/etc/nginx/templates/default.conf.template:ro"]
+    ports:
+      - "127.0.0.1:8091:8080"
+
+  frontend:
+    image: digital-twin-afdd-frontend:cloudtest
+    depends_on: [lb]
+    environment:
+      BACKEND_UPSTREAM: http://lb:8080
+      MQTT_UPSTREAM: http://127.0.0.1:9
+    ports:
+      - "127.0.0.1:8090:80"
+
+  simulator:
+    image: afdd-backend:cloudtest
+    depends_on:
+      api1: { condition: service_healthy }
+      api2: { condition: service_healthy }
+    entrypoint: ["afdd-sim"]
+    command: ["start"]
+    healthcheck: { disable: true }
+    environment:
+      ORG_ALIAS: local
+      PROJECT_ALIAS: digital_twin_afdd
+      DATABASE_URL: postgres://afdd_api:cloudtest-api@db:5432/afdd?sslmode=require
+      API_URL: http://lb:8080
+      SIM_TRANSPORT: http
+      DEMO_PASSWORD: Demo@2026
+      HISTORY_DAYS: "2"
+      SIM_WORKFORCE: "true"
+      SIM_JOBS: "false"
+      DEFAULT_TIMEZONE: Asia/Singapore
+
+  agent:
+    image: afdd-ai:cloudtest
+    profiles: ["ai"]
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["uvicorn", "afdd_ai.agent.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment: *ai-env
+
+  mcp-db:
+    image: afdd-ai:cloudtest
+    profiles: ["ai"]
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["python", "-m", "afdd_ai.mcp.serve", "db"]
+    environment:
+      <<: *ai-env
+      MCP_DB_PORT: "8080"
+
+  mcp-twin:
+    image: afdd-ai:cloudtest
+    profiles: ["ai"]
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["python", "-m", "afdd_ai.mcp.serve", "twin"]
+    environment:
+      <<: *ai-env
+      MCP_TWIN_PORT: "8080"
+
+  analytics1: &analytics
+    image: afdd-ai:cloudtest
+    profiles: ["ai"]
+    depends_on: { grants: { condition: service_completed_successfully } }
+    command: ["python", "-m", "afdd_ai.analytics.worker"]
+    environment: *ai-env
+  analytics2: *analytics
+
+volumes:
+  dbdata:
