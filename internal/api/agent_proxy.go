@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"afdd/internal/auth"
+	"afdd/internal/gcpauth"
 	"afdd/internal/httpx"
 )
 
@@ -33,7 +34,10 @@ const (
 	agentPrefix  = "/api/agent"
 	agentMaxBody = 1 << 20 // chat requests are small JSON documents
 
-	agentSecretHeader      = "X-Agent-Secret"
+	agentSecretHeader = "X-Agent-Secret"
+	// serverlessAuthHeader carries the Google ID token Cloud Run checks
+	// (Authorization stays free for the application's own credentials).
+	serverlessAuthHeader   = "X-Serverless-Authorization"
 	agentUserIDHeader      = "X-AFDD-User-Id"
 	agentUsernameHeader    = "X-AFDD-Username"
 	agentUserNameHeader    = "X-AFDD-User-Name"
@@ -126,11 +130,24 @@ func (s *Server) proxyAgent(w http.ResponseWriter, r *http.Request, u *auth.User
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, agentMaxBody)
 	}
-	newAgentProxy(target, s.cfg.AgentSecret, id).ServeHTTP(w, r)
+	// A private Cloud Run agent admits callers with an ID token of an invoker.
+	var idToken string
+	if s.cfg.AgentIDToken {
+		aud := s.cfg.AgentIDTokenAudience
+		if aud == "" {
+			aud = gcpauth.Audience(target.String())
+		}
+		if idToken, err = gcpauth.IDToken(r.Context(), aud); err != nil {
+			slog.Error("AI assistant: no ID token for the agent service", "audience", aud, "err", err)
+			writeAgentUnavailable(w)
+			return
+		}
+	}
+	newAgentProxy(target, s.cfg.AgentSecret, id, idToken).ServeHTTP(w, r)
 }
 
 // newAgentProxy builds the reverse proxy of one request.
-func newAgentProxy(target *url.URL, secret string, id agentIdentity) *httputil.ReverseProxy {
+func newAgentProxy(target *url.URL, secret string, id agentIdentity, idToken string) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			p := strings.TrimPrefix(pr.In.URL.Path, agentPrefix)
@@ -147,6 +164,9 @@ func newAgentProxy(target *url.URL, secret string, id agentIdentity) *httputil.R
 			pr.SetURL(target)
 			pr.SetXForwarded()
 			setAgentHeaders(pr.Out.Header, secret, id)
+			if idToken != "" {
+				pr.Out.Header.Set(serverlessAuthHeader, "Bearer "+idToken)
+			}
 		},
 		Transport:     agentHTTPTransport(),
 		FlushInterval: -1,
@@ -199,6 +219,7 @@ func setAgentHeaders(h http.Header, secret string, id agentIdentity) {
 	}
 	h.Del(auth.SessionHeader)
 	h.Del("Authorization")
+	h.Del(serverlessAuthHeader)
 	h.Del("Cookie")
 	perms := append([]string(nil), id.Permissions...)
 	sort.Strings(perms)
