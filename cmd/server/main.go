@@ -1,10 +1,14 @@
 // Command server runs the AFDD (asset monitoring & digital maintenance)
 // backend: HTTP API, embedded MQTT broker, data hub, evaluation engine and
-// background scheduler.
+// background scheduler - all in one process (`serve`, the local deployment),
+// or split for Cloud Run into stateless HTTP replicas (`api`) and one
+// processing worker (`worker`) that share their live state in the database.
 //
 // Usage:
 //
-//	server [serve]                       run the backend (default)
+//	server [serve]                       run the whole backend (default)
+//	server api                           HTTP API only (no broker, collectors, evaluation, scheduler or migrations)
+//	server worker                        collectors, evaluation and scheduler under a database lease (no HTTP)
 //	server migrate                       apply database migrations and exit
 //	server create-user -username U -password P [-role superuser|admin|basic] [-name N] [-email E]
 //	server reset-password -username U -password P
@@ -27,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,6 +42,8 @@ import (
 	"afdd/internal/datahub"
 	"afdd/internal/db"
 	"afdd/internal/engine"
+	"afdd/internal/events"
+	"afdd/internal/lease"
 	"afdd/internal/license"
 	"afdd/internal/maint"
 	"afdd/internal/notify"
@@ -44,6 +51,19 @@ import (
 	"afdd/internal/storage"
 	"afdd/internal/tlsutil"
 )
+
+// role is what a process runs.
+type role int
+
+const (
+	roleAll    role = iota // everything (local)
+	roleAPI                // HTTP replicas
+	roleWorker             // continuous processing
+)
+
+func (r role) String() string {
+	return [...]string{"all-in-one", "api", "worker"}[r]
+}
 
 var version = "dev"
 
@@ -56,7 +76,11 @@ func main() {
 	var err error
 	switch cmd {
 	case "serve":
-		err = serve()
+		err = serve(roleAll)
+	case "api":
+		err = serve(roleAPI)
+	case "worker":
+		err = serve(roleWorker)
 	case "migrate":
 		err = migrate()
 	case "create-user":
@@ -81,7 +105,9 @@ func main() {
 }
 
 const usage = `commands:
-  serve            run the backend (default)
+  serve            run the whole backend (default)
+  api              HTTP API only: stateless replicas reading the shared live state
+  worker           data collection, evaluation and scheduling (one active instance)
   migrate          apply database migrations
   create-user      -username U -password P [-role superuser|admin|basic] [-name N] [-email E]
   reset-password   -username U -password P
@@ -131,13 +157,13 @@ func migrate() error {
 	return nil
 }
 
-func serve() error {
+func serve(r role) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	setupLogging(cfg.LogLevel)
-	slog.Info("starting AFDD backend", "version", version)
+	slog.Info("starting AFDD backend", "version", version, "role", r.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -146,54 +172,75 @@ func serve() error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	database, err := openDB(ctx, cfg)
+	// Administration at start-up only for the all-in-one process by default;
+	// in the cloud a provisioning job migrates and a scheduled job maintains
+	// partitions with a privileged identity.
+	all := r == roleAll
+	database, err := db.OpenWait(ctx, cfg.DatabaseURL, cfg.DBConnectTimeout)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
-
+	if config.Or(cfg.RuntimeMigrations, all) {
+		if err := database.Migrate(ctx); err != nil {
+			return err
+		}
+	}
 	// The AI services log in with these roles; the core backend runs without
 	// them, so a failure is reported but not fatal.
-	if err := db.EnsureServiceRoles(ctx, database, cfg.AIDBPassword, cfg.AIDBROPassword); err != nil {
-		slog.Error("enable AI service database roles", "err", err)
+	if config.Or(cfg.EnsureServiceRoles, all) {
+		if err := db.EnsureServiceRoles(ctx, database, cfg.AIDBPassword, cfg.AIDBROPassword); err != nil {
+			slog.Error("enable AI service database roles", "err", err)
+		}
+	}
+	partitions := config.Or(cfg.PartitionMaintenance, all)
+
+	var store, docsStore *storage.Store
+	if r != roleWorker {
+		storeOpts := storage.Options{Provider: cfg.StorageProvider, Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey,
+			SecretKey: cfg.MinioSecretKey, Bucket: cfg.MinioBucket, UseSSL: cfg.MinioUseSSL, Region: cfg.MinioRegion, Wait: cfg.DBConnectTimeout}
+		docsOpts := storeOpts
+		docsOpts.Bucket = cfg.DocsBucket
+		if cfg.StorageProvider == "gcs" {
+			storeOpts.Endpoint, storeOpts.Bucket = cfg.GCSEndpoint, cfg.GCSAssetsBucket
+			docsOpts.Endpoint, docsOpts.Bucket = cfg.GCSEndpoint, cfg.GCSDocsBucket
+		}
+		if store, err = storage.New(ctx, storeOpts); err != nil {
+			return err
+		}
+		// Private bucket of the AI document library (never served under /public).
+		if docsStore, err = storage.New(ctx, docsOpts); err != nil {
+			return err
+		}
 	}
 
-	storeOpts := storage.Options{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey, SecretKey: cfg.MinioSecretKey,
-		Bucket: cfg.MinioBucket, UseSSL: cfg.MinioUseSSL, Region: cfg.MinioRegion}
-	store, err := storage.New(ctx, storeOpts)
-	if err != nil {
-		return err
-	}
-	// Private bucket of the AI document library (never served under /public).
-	docsOpts := storeOpts
-	docsOpts.Bucket = cfg.DocsBucket
-	docsStore, err := storage.New(ctx, docsOpts)
-	if err != nil {
-		return err
-	}
-
-	tlsCfg, err := tlsutil.Load(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.DataDir)
-	if err != nil {
-		return err
+	var tlsCfg *tls.Config
+	runBroker := cfg.MQTTEnabled && r != roleAPI
+	if (r != roleWorker && cfg.HTTPTLS) || runBroker {
+		if tlsCfg, err = tlsutil.Load(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.DataDir); err != nil {
+			return err
+		}
 	}
 
 	authSvc := auth.NewService(database, cfg.SessionTTL)
-	created, generated, err := authSvc.EnsureBootstrapUser(ctx, cfg.BootstrapUsername, cfg.BootstrapPassword)
-	if err != nil {
-		return err
-	}
-	if created {
-		if generated != "" {
-			slog.Warn("created initial superuser with a generated password - change it after first login",
-				"username", cfg.BootstrapUsername, "password", generated)
-		} else {
-			slog.Info("created initial superuser", "username", cfg.BootstrapUsername)
+	if r != roleWorker {
+		created, generated, err := authSvc.EnsureBootstrapUser(ctx, cfg.BootstrapUsername, cfg.BootstrapPassword)
+		if err != nil {
+			return err
+		}
+		if created {
+			if generated != "" {
+				slog.Warn("created initial superuser with a generated password - change it after first login",
+					"username", cfg.BootstrapUsername, "password", generated)
+			} else {
+				slog.Info("created initial superuser", "username", cfg.BootstrapUsername)
+			}
 		}
 	}
 
 	var mqttBroker *broker.Broker
 	var publisher notify.Publisher
-	if cfg.MQTTEnabled {
+	if runBroker {
 		opts := broker.Options{TCPAddr: cfg.MQTTTCPAddr, TLSAddr: cfg.MQTTTLSAddr, TLSConfig: tlsCfg, WSAddr: cfg.MQTTWSAddr,
 			UIUsername: cfg.MQTTClientUsername, UIPassword: cfg.MQTTClientPassword, NotificationTopic: cfg.NotificationTopic}
 		if cfg.MQTTWSTLS {
@@ -210,10 +257,12 @@ func serve() error {
 	notifier := notify.New(database, publisher, cfg.NotificationTopic)
 
 	hub := datahub.New(database, mqttBroker, cfg.ScriptTimeout, cfg.DataDir, cfg.OrgAlias+"."+cfg.ProjectAlias)
-	if err := hub.Start(ctx); err != nil {
-		return fmt.Errorf("start data hub: %w", err)
+	switch r {
+	case roleAPI:
+		hub.SetMode(datahub.ModeReplica, cfg.LiveFlushInterval, cfg.LiveRefreshInterval)
+	case roleWorker:
+		hub.SetMode(datahub.ModeWorker, cfg.LiveFlushInterval, cfg.LiveRefreshInterval)
 	}
-	defer hub.Stop()
 
 	licMgr, err := license.NewManager(database, cfg.LicensePublicKey)
 	if err != nil {
@@ -229,6 +278,19 @@ func serve() error {
 	eng := engine.New(database, hub, notifier, engine.Options{EvalInterval: cfg.EvalInterval, LogInterval: cfg.LogInterval,
 		OfflineTimeout: cfg.OfflineTimeout, ScriptTimeout: cfg.ScriptTimeout, LicenseEnforced: cfg.LicenseEnforced,
 		EarlyWarningCool: cfg.EarlyWarningCooldown})
+	if r == roleAPI {
+		// definitions changed here are evaluated by the worker: one event per
+		// second at most (a bulk edit invalidates many times), sent after the burst
+		var pending atomic.Bool
+		eng.OnInvalidate = func() {
+			if pending.CompareAndSwap(false, true) {
+				time.AfterFunc(time.Second, func() {
+					pending.Store(false)
+					events.Emit(context.Background(), database, events.Engine, "")
+				})
+			}
+		}
+	}
 	maintSvc := maint.New(database, notifier, loc)
 	maintSvc.OnEquipmentChanged = eng.Invalidate
 	eng.SetHooks(maintSvc)
@@ -236,22 +298,74 @@ func serve() error {
 	srv := api.New(api.Deps{Config: cfg, DB: database, Store: store, Auth: authSvc, Notify: notifier, Hub: hub, Engine: eng,
 		Maint: maintSvc, License: licMgr, Broker: mqttBroker, DocsStore: docsStore})
 
-	sched := scheduler.New(scheduler.Deps{DB: database, Notify: notifier, Maint: maintSvc, CleanSessions: authSvc.CleanupExpired,
-		RefreshKPIs: srv.RefreshKPIs, RetentionDays: cfg.RetentionDays})
-	// The engine logs into monthly partitions of ts.parameter_values: make sure
-	// the current and the coming months exist before it starts. Not fatal: the
-	// migration created months ahead and the scheduled job retries.
-	if err := sched.MaintainPartitions(ctx); err != nil {
-		slog.Error("partition maintenance at start-up", "err", err)
+	// One processing worker at a time: a replacement waits for the lease.
+	leaseLost := make(chan struct{})
+	if r == roleWorker {
+		l, err := lease.Acquire(ctx, database, lease.ProcessingWorker, "processing-worker", 5*time.Second)
+		if err != nil {
+			return err
+		}
+		defer l.Release()
+		go func() {
+			select {
+			case <-l.Lost():
+				slog.Error("processing lease lost, stopping")
+				close(leaseLost)
+				stop()
+			case <-ctx.Done():
+			}
+		}()
 	}
 
-	engineDone := make(chan struct{})
-	go func() {
-		defer close(engineDone)
-		eng.Run(ctx)
-	}()
+	if err := hub.Start(ctx); err != nil {
+		return fmt.Errorf("start data hub: %w", err)
+	}
+	defer hub.Stop()
 
-	sched.Start(ctx)
+	var sched *scheduler.Scheduler
+	engineDone := make(chan struct{})
+	if r == roleAPI {
+		close(engineDone)
+	} else {
+		sched = scheduler.New(scheduler.Deps{DB: database, Notify: notifier, Maint: maintSvc, CleanSessions: authSvc.CleanupExpired,
+			RefreshKPIs: srv.RefreshKPIs, RetentionDays: cfg.RetentionDays, NoPartitionJobs: !partitions})
+		// The engine logs into monthly partitions of ts.parameter_values: make sure
+		// the current and the coming months exist before it starts. Not fatal: the
+		// migration created months ahead and the scheduled job retries.
+		if partitions {
+			if err := sched.MaintainPartitions(ctx); err != nil {
+				slog.Error("partition maintenance at start-up", "err", err)
+			}
+		}
+		go func() {
+			defer close(engineDone)
+			eng.Run(ctx)
+		}()
+		sched.Start(ctx)
+	}
+	if r == roleWorker {
+		// configuration changed through the API replicas
+		go events.Watch(ctx, database, 2*time.Second, func(kind, key string) {
+			switch kind {
+			case events.Gateway:
+				if err := hub.Reload(ctx, key); err != nil {
+					slog.Error("reload gateway", "alias", key, "err", err)
+				}
+			case events.Engine:
+				eng.Invalidate()
+			}
+		})
+		<-ctx.Done()
+		slog.Info("shutting down")
+		sched.Wait()
+		<-engineDone
+		select {
+		case <-leaseLost:
+			return errors.New("processing lease lost")
+		default:
+			return nil
+		}
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -291,7 +405,9 @@ func serve() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
-	sched.Wait()
+	if sched != nil {
+		sched.Wait()
+	}
 	<-engineDone
 	return nil
 }
