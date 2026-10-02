@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"afdd/internal/auth"
 	"afdd/internal/db"
 	"afdd/internal/engine"
 	"afdd/internal/httpx"
@@ -33,6 +34,7 @@ func (s *Server) registerLocation() {
 	s.handle("location_overview/getlocationapq", AccessUser, s.loAPQ)
 	s.handle("location_overview/getlocationancestors", AccessUser, s.loAncestors)
 	s.handle("location_overview/getlocationtreeexport", AccessUser, s.loExport)
+	s.handle("location_overview/getplantoverview", AccessUser, s.loPlantOverview)
 }
 
 func (s *Server) locTreeByFilter(c *Ctx) (any, error) {
@@ -701,79 +703,92 @@ type locStats struct {
 // subtreeStats counts current statuses/conditions of all visible equipment
 // under each location.
 func (s *Server) subtreeStats(c *Ctx, tree *locTree, locIDs []int64) (map[int64]*locStats, error) {
-	scope, err := c.Scope()
+	byLoc, all, err := s.visibleEquipment(c)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.Query(c, `SELECT e.id, e.location_id FROM asset.equipment e`)
-	if err != nil {
-		return nil, err
-	}
-	byLoc := map[int64][]int64{}
-	var all []int64
-	for rows.Next() {
-		var id, loc int64
-		if err := rows.Scan(&id, &loc); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if scope.AllowsLocation(loc) {
-			byLoc[loc] = append(byLoc[loc], id)
-			all = append(all, id)
-		}
-	}
-	rows.Close()
 	states, err := s.currentStates(c, all)
 	if err != nil {
 		return nil, err
 	}
 	out := map[int64]*locStats{}
 	for _, l := range locIDs {
-		st := &locStats{}
-		for d := range tree.descendants([]int64{l}) {
-			for _, a := range byLoc[d] {
-				st.total++
-				cs := states[a]
-				switch {
-				case cs == nil || cs.Status == 0 || cs.Status == engine.StatusOffline:
-					st.offline++
-				case cs.Status == engine.StatusRunning:
-					st.running++
-				case cs.Status == engine.StatusIdle:
-					st.idle++
-				case cs.Status == engine.StatusPlannedDown:
-					st.planned++
-				case cs.Status == engine.StatusUnplannedDown:
-					st.unplanned++
-				}
-				if cs != nil {
-					switch cs.Condition {
-					case engine.CondNormal:
-						st.normal++
-					case engine.CondWarning:
-						st.warning++
-					case engine.CondCritical:
-						st.critical++
-					}
-				}
-			}
-		}
-		out[l] = st
+		out[l] = countStates(assetsUnder(tree, byLoc, l), states)
 	}
 	return out, nil
 }
 
-func (s *Server) loDirectChildren(c *Ctx) (any, error) {
-	tree, err := s.loadLocations(c)
-	if err != nil {
-		return nil, err
-	}
+// visibleEquipment returns the equipment the user may see, by location.
+func (s *Server) visibleEquipment(c *Ctx) (byLoc map[int64][]int64, all []int64, err error) {
 	scope, err := c.Scope()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	rows, err := s.DB.Query(c, `SELECT e.id, e.location_id FROM asset.equipment e`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	byLoc = map[int64][]int64{}
+	for rows.Next() {
+		var id, loc int64
+		if err := rows.Scan(&id, &loc); err != nil {
+			return nil, nil, err
+		}
+		if scope.AllowsLocation(loc) {
+			byLoc[loc] = append(byLoc[loc], id)
+			all = append(all, id)
+		}
+	}
+	return byLoc, all, rows.Err()
+}
+
+// assetsUnder lists the equipment in the subtrees of the given locations.
+func assetsUnder(tree *locTree, byLoc map[int64][]int64, locIDs ...int64) []int64 {
+	var out []int64
+	for d := range tree.descendants(locIDs) {
+		out = append(out, byLoc[d]...)
+	}
+	return out
+}
+
+// countStates counts the current statuses and conditions of equipment.
+func countStates(assets []int64, states map[int64]*currentState) *locStats {
+	st := &locStats{}
+	for _, a := range assets {
+		st.total++
+		cs := states[a]
+		switch {
+		case cs == nil || cs.Status == 0 || cs.Status == engine.StatusOffline:
+			st.offline++
+		case cs.Status == engine.StatusRunning:
+			st.running++
+		case cs.Status == engine.StatusIdle:
+			st.idle++
+		case cs.Status == engine.StatusPlannedDown:
+			st.planned++
+		case cs.Status == engine.StatusUnplannedDown:
+			st.unplanned++
+		}
+		if cs != nil {
+			switch cs.Condition {
+			case engine.CondNormal:
+				st.normal++
+			case engine.CondWarning:
+				st.warning++
+			case engine.CondCritical:
+				st.critical++
+			}
+		}
+	}
+	return st
+}
+
+// childLocations returns the visible children of a location (without one:
+// the top-most visible locations) whose name contains search, by name.
+func childLocations(tree *locTree, scope *auth.Scope, id *int64, search string) []int64 {
 	var children []int64
-	if id := c.F.IntPtr("location_id"); id != nil && tree.nodes[*id] != nil {
+	if id != nil && tree.nodes[*id] != nil {
 		children = tree.nodes[*id].Children
 	} else {
 		// Top-most visible locations.
@@ -791,7 +806,7 @@ func (s *Server) loDirectChildren(c *Ctx) (any, error) {
 			find(r)
 		}
 	}
-	search := strings.ToLower(c.F.StrTrim("search_filter"))
+	search = strings.ToLower(search)
 	var visible []int64
 	for _, id := range children {
 		if !scope.AllowsLocation(id) {
@@ -805,6 +820,19 @@ func (s *Server) loDirectChildren(c *Ctx) (any, error) {
 	sort.SliceStable(visible, func(i, j int) bool {
 		return strings.ToLower(tree.name(visible[i])) < strings.ToLower(tree.name(visible[j]))
 	})
+	return visible
+}
+
+func (s *Server) loDirectChildren(c *Ctx) (any, error) {
+	tree, err := s.loadLocations(c)
+	if err != nil {
+		return nil, err
+	}
+	scope, err := c.Scope()
+	if err != nil {
+		return nil, err
+	}
+	visible := childLocations(tree, scope, c.F.IntPtr("location_id"), c.F.StrTrim("search_filter"))
 	total := len(visible)
 	const pageSize = 6
 	page := c.page(1)
