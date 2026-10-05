@@ -33,9 +33,9 @@ x-ai-env: &ai-env
   AI_MODEL_PRO: ${AI_MODEL_PRO:-gemini-3.1-pro-preview}
   AI_MODEL_LITE: ${AI_MODEL_LITE:-gemini-3.5-flash-lite}
   AI_EMBED_MODEL: ${AI_EMBED_MODEL:-gemini-embedding-001}
-  AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0.50}
+  AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0} # 0 = no limit (demo); a positive value caps the daily Gemini spend
   AI_MAX_LLM_CALLS: ${AI_MAX_LLM_CALLS:-10}
-  AI_USER_DAILY_BUDGET_USD: ${AI_USER_DAILY_BUDGET_USD:-0.20}
+  AI_USER_DAILY_BUDGET_USD: ${AI_USER_DAILY_BUDGET_USD:-0} # per user per day; 0 = no limit
   AI_ANALYTICS_RESERVE_USD: ${AI_ANALYTICS_RESERVE_USD:-0.10}
   AGENT_ALLOWED_HOSTS: ${AGENT_ALLOWED_HOSTS:-ai-agent,localhost,127.0.0.1}
   OPTIMIZER_INTERVAL_MIN: ${OPTIMIZER_INTERVAL_MIN:-60}
@@ -129,6 +129,8 @@ services:
       MINIO_BUCKET: afdd
       BOOTSTRAP_USERNAME: ${BOOTSTRAP_USERNAME:-superuser}
       BOOTSTRAP_PASSWORD: ${BOOTSTRAP_PASSWORD:-}
+      # Demo mode: every visitor is signed in as this user without a password (empty = off)
+      DEMO_USER: ${DEMO_USER:-}
       LICENSE_PUBLIC_KEY: ${LICENSE_PUBLIC_KEY:-}
       DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-Asia/Singapore}
       # Put certificate files in ./certs and set e.g.
@@ -139,7 +141,7 @@ services:
       # Agentic AI: /api/agent/ proxy target, shared secret, private documents
       # bucket, and the login passwords the backend sets on afdd_ai / afdd_ai_ro.
       AGENT_URL: ${AGENT_URL:-http://ai-agent:8000}
-      AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0.50}
+      AI_DAILY_BUDGET_USD: ${AI_DAILY_BUDGET_USD:-0} # shown on AI Insights; 0 = no limit
       AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-afdd-agent-dev-secret}
       MINIO_DOCS_BUCKET: ${MINIO_DOCS_BUCKET:-afdd-docs}
       AI_DB_PASSWORD: ${AI_DB_PASSWORD:-afdd-ai-dev}
