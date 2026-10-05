@@ -95,6 +95,9 @@ type Config struct {
 	// Bootstrap superuser (created when no superuser exists)
 	BootstrapUsername string
 	BootstrapPassword string
+	// DemoUser signs every visitor in as this user without a password (demo
+	// deployments with authentication switched off); empty = off.
+	DemoUser string
 
 	// Engine
 	EvalInterval         time.Duration
@@ -171,6 +174,7 @@ func Load() (*Config, error) {
 
 		BootstrapUsername: env("BOOTSTRAP_USERNAME", "superuser"),
 		BootstrapPassword: env("BOOTSTRAP_PASSWORD", ""),
+		DemoUser:          env("DEMO_USER", ""),
 
 		EvalInterval:         envDuration("EVAL_INTERVAL", 10*time.Second),
 		LogInterval:          envDuration("LOG_INTERVAL", time.Minute),
