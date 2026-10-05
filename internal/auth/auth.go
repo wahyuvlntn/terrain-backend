@@ -162,10 +162,27 @@ func (s *Service) Login(ctx context.Context, username, password string) (string,
 	if !CheckPassword(hash, password) {
 		return "", ErrInvalidCredentials
 	}
-	token := newToken()
-	_, err = s.db.Exec(ctx, `INSERT INTO core.sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`,
-		token, id, time.Now().Add(s.ttl))
+	return s.newSession(ctx, id)
+}
+
+// LoginAs opens a session for a user without a password (demo mode only).
+func (s *Service) LoginAs(ctx context.Context, username string) (string, error) {
+	var id int64
+	err := s.db.QueryRow(ctx, `SELECT id FROM core.users WHERE lower(username) = lower($1) AND NOT is_deleted`,
+		strings.TrimSpace(username)).Scan(&id)
 	if err != nil {
+		if db.IsNoRows(err) {
+			return "", ErrInvalidCredentials
+		}
+		return "", err
+	}
+	return s.newSession(ctx, id)
+}
+
+func (s *Service) newSession(ctx context.Context, userID int64) (string, error) {
+	token := newToken()
+	if _, err := s.db.Exec(ctx, `INSERT INTO core.sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`,
+		token, userID, time.Now().Add(s.ttl)); err != nil {
 		return "", err
 	}
 	return token, nil

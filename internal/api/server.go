@@ -7,6 +7,7 @@
 //	POST /api/database-connection/exposed/execute/{org}/{project}/{db}/{category}/{query}
 //	     response: JSON array of rows
 //	POST /api/user-management/exposed/get-session-add-expiry
+//	POST /api/user-management/exposed/demo-session (only with DEMO_USER)
 //
 // Each script is registered here as a Go handler.
 package api
@@ -195,6 +196,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/database-connection/exposed/execute/", s.serveDBQuery)
 	mux.HandleFunc("/api/user-management/exposed/get-session-add-expiry", s.serveLogin)
 	mux.HandleFunc("/api/user-management/exposed/logout", s.serveLogout)
+	mux.HandleFunc("/api/user-management/exposed/demo-session", s.serveDemoSession)
 	mux.HandleFunc("/api/datahub/rest/", s.serveRestIngest)
 	mux.HandleFunc("/healthz", s.serveHealth)
 	// AI assistant (SSE reverse proxy to the agent service) and the RAG
@@ -392,6 +394,29 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			httpx.WriteError(w, r, httpx.BadRequest("err_invalid_username_password"))
+			return
+		}
+		httpx.WriteError(w, r, httpx.Internal(err))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"session_id": token})
+}
+
+// serveDemoSession signs in as DEMO_USER without a password, so a demo
+// deployment needs no login page. Not found while DEMO_USER is unset.
+func (s *Server) serveDemoSession(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.DemoUser == "" {
+		httpx.WriteError(w, r, httpx.NotFound("Not found"))
+		return
+	}
+	if r.Method != http.MethodPost {
+		httpx.WriteError(w, r, &httpx.Error{Status: http.StatusMethodNotAllowed, Msg: "Method not allowed"})
+		return
+	}
+	token, err := s.Auth.LoginAs(r.Context(), s.cfg.DemoUser)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			httpx.WriteError(w, r, httpx.NotFound("err_demo_user_not_found"))
 			return
 		}
 		httpx.WriteError(w, r, httpx.Internal(err))
