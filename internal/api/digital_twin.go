@@ -23,6 +23,7 @@ func (s *Server) registerDigitalTwin() {
 	s.handle("digital_twin/getassetsummary", AccessUser, s.twinAssetSummary)
 	s.handle("digital_twin/getliveoverview", AccessUser, s.twinLiveOverview)
 	s.handle("digital_twin/getamhs", AccessUser, s.twinAMHS)
+	s.handle("digital_twin/gettoolactivity", AccessUser, s.twinToolActivity)
 }
 
 // twinAssets lists every visible equipment with its alias and current state.
