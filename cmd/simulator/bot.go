@@ -25,6 +25,7 @@ type Bot struct {
 	approve  time.Duration
 	tzOffset int
 	pending  []pendingTrip
+	snap     *Plant // copy of the live plant for this cycle's work starts (mayStop)
 }
 
 type pendingTrip struct {
@@ -153,6 +154,7 @@ func (b *Bot) work() error {
 	if err != nil {
 		return err
 	}
+	b.snap = nil
 	now := time.Now()
 	idle := func(o *botOrder, d time.Duration) bool { return now.Sub(o.LastEvent) >= d }
 	// A technician works on one job at a time.
@@ -186,6 +188,13 @@ func (b *Bot) work() error {
 			if !now.After(o.PStart) || !idle(o, 5*time.Minute) {
 				continue
 			}
+			stop, serr := b.mayStop(o.Alias)
+			if serr != nil {
+				return serr
+			}
+			if !stop {
+				continue // stays open until a standby unit is back
+			}
 			for _, t := range o.Techs {
 				if busy[t] {
 					continue
@@ -193,6 +202,9 @@ func (b *Bot) work() error {
 				busy[t] = true
 				err = b.as(t, "maintenance_order_work_report/start_work_report", map[string]any{"maintenance_id": o.ID, "is_status_change": true})
 				b.logAct(err, "work started", o, t)
+				if err == nil {
+					b.snap.ByAlias[o.Alias].Maint = true // the live plant stops it at its next syncForced
+				}
 				break
 			}
 		case 7: // paused -> resume when the technician is free
@@ -235,6 +247,23 @@ func (b *Bot) work() error {
 		}
 	}
 	return nil
+}
+
+// mayStop reports whether the equipment may stop for maintenance now: a
+// chiller, its dedicated pumps or a tower only while the other units still
+// cover the duty chillers (Plant.canStop). It reads a copy of the live plant
+// taken once per cycle (the plant is only safe to read on the simulation loop).
+func (b *Bot) mayStop(alias string) (bool, error) {
+	if b.snap == nil {
+		ctx, cancel := context.WithTimeout(b.ctx, 10*time.Second)
+		defer cancel()
+		p, err := b.live.Snapshot(ctx, 0)
+		if err != nil {
+			return false, fmt.Errorf("plant snapshot: %w", err)
+		}
+		b.snap = p
+	}
+	return b.snap.canStop(b.snap.ByAlias[alias]), nil
 }
 
 func (b *Bot) as(user, script string, form map[string]any) error {
