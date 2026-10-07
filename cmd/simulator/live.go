@@ -122,6 +122,9 @@ type LiveOptions struct {
 	MaxFaults   int
 	RampMin     float64
 	RampMax     float64
+	// FDDEvery is the mean time between labelled LBNL faults in the live
+	// plant, so the analytics fault list and FDD orders stay current (0: off).
+	FDDEvery time.Duration
 }
 
 // Live streams simulated telemetry to the backend broker.
@@ -136,6 +139,7 @@ type Live struct {
 	nextF   time.Time
 	nextT   time.Time
 	nextO   time.Time
+	nextD   time.Time
 	lastChk time.Time
 	seen    map[string]bool
 	trips   chan *Asset      // tripped assets for the operator bot
@@ -152,6 +156,9 @@ func newLive(ctx context.Context, db *pgxpool.Pool, plant *Plant, opts LiveOptio
 	l.nextF = now.Add(l.expo(opts.FaultEvery) / 2)
 	l.nextT = now.Add(l.expo(opts.TripEvery))
 	l.nextO = now.Add(l.expo(opts.OfflineEvry))
+	if opts.FDDEvery > 0 {
+		l.nextD = now.Add(l.expo(opts.FDDEvery) / 2)
+	}
 	l.lastChk = now.Add(-time.Minute)
 	return l
 }
@@ -454,6 +461,10 @@ func (l *Live) scenario(now time.Time, dt float64) {
 		l.nextT = now.Add(l.expo(l.opts.TripEvery))
 		l.plant.injectRandomTrip(l.rng, now)
 	}
+	if l.opts.FDDEvery > 0 && now.After(l.nextD) {
+		l.nextD = now.Add(l.expo(l.opts.FDDEvery))
+		l.injectLBNL(now)
+	}
 	if now.After(l.nextO) {
 		l.nextO = now.Add(l.expo(l.opts.OfflineEvry))
 		a := l.plant.Assets[l.rng.IntN(len(l.plant.Assets))]
@@ -463,6 +474,36 @@ func (l *Live) scenario(now time.Time, dt float64) {
 }
 
 func (l *Live) uniform(a, b float64) float64 { return a + l.rng.Float64()*(b-a) }
+
+// injectLBNL starts a labelled LBNL fault with one of its documented
+// intensities on a running unit without one; the FDD order repairs it.
+func (l *Live) injectLBNL(now time.Time) {
+	type cand struct {
+		a  *Asset
+		fs FaultSpec
+	}
+	var cs []cand
+	for _, a := range l.plant.Assets {
+		if !a.Running() || a.Offline || hasManualFault(a) {
+			continue
+		}
+		for _, fs := range a.Model.Faults {
+			if fs.Manual && len(fs.Intensities) > 0 {
+				cs = append(cs, cand{a, fs})
+			}
+		}
+	}
+	if len(cs) == 0 {
+		return
+	}
+	c := cs[l.rng.IntN(len(cs))]
+	v := c.fs.Intensities[l.rng.IntN(len(c.fs.Intensities))]
+	if _, err := c.a.injectFault(c.fs.Kind, v, now, 1.25/(l.opts.RampMax*60)); err != nil {
+		slog.Warn("labelled fault not started", "equipment", c.a.Spec.Alias, "fault", c.fs.Kind, "err", err)
+		return
+	}
+	slog.Info("labelled FDD fault started", "equipment", c.a.Spec.Alias, "fault", c.fs.Kind, "value", v)
+}
 
 // flushFab stores the production records changed since the last flush; on
 // failure they are kept for the next one (up to a limit).
