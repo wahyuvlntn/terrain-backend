@@ -363,11 +363,15 @@ func (h *History) plan() {
 	at := func(min time.Duration) time.Time {
 		return h.start.Add(min + time.Duration(h.rng.Float64()*float64(span-min-time.Hour)))
 	}
-	// Degradations: about one per asset every 45 days (never the Manual
-	// LBNL faults, planned below).
+	// Degradations: about one per asset every 30 days, every 20 days on a
+	// process tool (never the Manual LBNL faults, planned below).
 	for _, a := range h.plant.Assets {
 		cands := a.Model.randomFaults()
-		n := poisson(h.rng, days/45)
+		mean := 30.0
+		if toolPhysics[a.Kind] != nil {
+			mean = 20
+		}
+		n := poisson(h.rng, days/mean)
 		for i := 0; i < n && len(cands) > 0; i++ {
 			f := cands[h.rng.IntN(len(cands))]
 			ramp := h.uniform(2, 9) * 86400
@@ -375,7 +379,7 @@ func (h *History) plan() {
 		}
 	}
 	// Make sure a few degradations are developing right now.
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 8; i++ {
 		a := h.plant.pick(h.rng, func(a *Asset) bool { return len(a.Model.randomFaults()) > 0 })
 		cands := a.Model.randomFaults()
 		f := cands[h.rng.IntN(len(cands))]
@@ -483,6 +487,36 @@ func (h *History) planLBNL() {
 	for _, k := range kinds {
 		if h.rng.IntN(2) == 0 {
 			place(k)
+		}
+	}
+	// the AI Insights fault list covers the last 7 days: one short episode of
+	// every kind there, repaired before the end, and two still developing at
+	// the end (the live plant carries them on and the analytics detects them)
+	if span < 10*24*time.Hour {
+		return
+	}
+	for i, j := range h.rng.Perm(len(kinds)) {
+		k := kinds[j]
+		for tries := 0; tries < 100; tries++ {
+			a := k.units[h.rng.IntN(len(k.units))]
+			dur := time.Duration(h.uniform(6, 20) * float64(time.Hour))
+			lo, hi := h.end.Add(-7*24*time.Hour), h.end.Add(-dur-after)
+			if i < 2 {
+				dur, lo, hi = 72*time.Hour, h.end.Add(-10*time.Hour), h.end.Add(-4*time.Hour)
+			}
+			at := lo.Add(time.Duration(h.rng.Float64() * float64(hi.Sub(lo)))).Truncate(time.Minute)
+			win := [2]time.Time{at.Add(-before), at.Add(dur + after)}
+			overlap := false
+			for _, b := range busy[a] {
+				overlap = overlap || (win[0].Before(b[1]) && b[0].Before(win[1]))
+			}
+			if overlap {
+				continue
+			}
+			busy[a] = append(busy[a], win)
+			h.episodes = append(h.episodes, &episode{At: at, Asset: a, Kind: "lbnl", Fault: k.fs.Kind,
+				Value: k.fs.Intensities[h.rng.IntN(len(k.fs.Intensities))], Dur: dur, Code: k.fs.Codes[0]})
+			break
 		}
 	}
 }
@@ -770,6 +804,12 @@ func (h *History) advance(o *hOrder, t time.Time) {
 		if t.Before(o.startAt) {
 			return
 		}
+		if o.forced > 0 && !h.plant.canStop(a) {
+			// the planner keeps the duty chillers available: the work waits
+			// for another unit to be back (rechecked every half hour of the day shift)
+			o.startAt = h.workTime(t.Add(30 * time.Minute))
+			return
+		}
 		o.stage = stProgress
 		ts := t
 		o.started = &ts
@@ -983,7 +1023,8 @@ func (h *History) startEpisode(e *episode, t time.Time) {
 	case "offline":
 		a.Offline, a.OffUntil = true, t.Add(e.Dur)
 	case "trip":
-		if a.Trip || a.Maint || !a.Running() || len(a.Model.Trips) == 0 {
+		// a chiller, its pump or a tower trips only while a standby can take over
+		if a.Trip || a.Maint || !a.Running() || len(a.Model.Trips) == 0 || !h.plant.canStop(a) {
 			return
 		}
 		ts := a.Model.Trips[0]
@@ -1081,9 +1122,18 @@ func (h *History) earlyWarning(a *Asset, d Diagnosis, ev Evaluation, t time.Time
 		sev = 1
 	}
 	det := t
+	issues := []string{code}
+	if d.IsCompound {
+		// a compound warning lists the alarm codes of its symptoms as issues too (as the engine)
+		for _, c := range d.Codes {
+			if !contains(issues, c) {
+				issues = append(issues, c)
+			}
+		}
+	}
 	o := &hOrder{FromSystem: true, RelName: d.Rel.Name, IsCompound: d.IsCompound, IsDeduct: d.IsDeduct, Severity: sev,
 		Desc:   fmt.Sprintf("%s detected by issue relation '%s': %s - %s", kind, d.Rel.Name, code, codeName(code)),
-		Issues: []string{code}, IssueStatus: d.Severity, Detected: &det, forced: 3, PStart: t}
+		Issues: issues, IssueStatus: d.Severity, Detected: &det, forced: 3, PStart: t}
 	o.PEnd = t.Add(h.minutes(a, o.Issues, 60))
 	for _, p := range d.Params {
 		hp := ev.Abnormal[p]

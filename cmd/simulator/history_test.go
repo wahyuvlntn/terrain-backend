@@ -104,7 +104,12 @@ func TestHistoryShort(t *testing.T) {
 			t.Errorf("FDD order %q relation %q", order.Desc, order.RelName)
 		}
 		if order.completed != nil {
-			if !f.done || f.Asset.Faults[f.Kind] != nil {
+			// a later episode of the same fault may still run at the end
+			later := false
+			for _, g := range h.fdd {
+				later = later || (g.Asset == f.Asset && g.Kind == f.Kind && g.Onset.After(f.Onset) && !g.done)
+			}
+			if !f.done || (f.Asset.Faults[f.Kind] != nil && !later) {
 				t.Errorf("%s on %s still active after its order completed", f.Kind, f.Asset.Spec.Alias)
 			}
 			if len(order.updates) == 0 {
@@ -135,5 +140,36 @@ func TestHistoryShort(t *testing.T) {
 	if s.manual("chws_reset_mode") || s.manual("staging_mode") || s.ctl("approach_sp", defApproachSP) != defApproachSP ||
 		s.ctl("riser_dp_sp", defRiserDPSP) != defRiserDPSP {
 		t.Errorf("controls not set back at the end: %v", s.Ctl)
+	}
+}
+
+// TestHistoryChillersAvailable generates a month of history (the demo
+// deployment's window) and checks that overlapping maintenance and trips
+// never stop every chiller: the fab always has load, so every stored sample
+// of the plant controller shows a running chiller. The LBNL episodes are
+// still repaired by their orders before the end of the window.
+func TestHistoryChillersAvailable(t *testing.T) {
+	p := newPlant(3, testLoc)
+	h := newHistory(context.Background(), nil, p, fakeIDs(p), 30, 3)
+	ep := h.ids.EP["CHWS_01"]["chillers_running"]
+	var off []time.Time
+	h.copyValues = func(rows [][]any) (int64, error) {
+		for _, r := range rows {
+			if r[0] == ep && r[2].(float64) < 1 {
+				off = append(off, r[1].(time.Time))
+			}
+		}
+		return int64(len(rows)), nil
+	}
+	if err := h.Generate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(off) > 0 {
+		t.Errorf("%d samples without a running chiller, from %s to %s", len(off), off[0].Format(time.RFC3339), off[len(off)-1].Format(time.RFC3339))
+	}
+	for _, f := range h.fdd {
+		if f.ClearBy.Before(h.end) && !f.done {
+			t.Errorf("%s on %s (planned end %s) not repaired by the end", f.Kind, f.Asset.Spec.Alias, f.ClearBy.Format(time.RFC3339))
+		}
 	}
 }
