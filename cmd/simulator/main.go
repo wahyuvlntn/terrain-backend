@@ -6,6 +6,8 @@
 //	simulator seed     configure the plant and generate the history only
 //	simulator run      live simulation only
 //	simulator history  regenerate the history (replaces all demo history and orders)
+//	simulator demo-ai  re-seed the demo AI records (faults, simulation jobs,
+//	                   recommendations) relative to now (demo_ai.go)
 //
 // Configuration (environment):
 //
@@ -16,14 +18,16 @@
 //	DEMO_PASSWORD       password of the demo users       (Demo@2026)
 //	HISTORY_DAYS        days of generated history        (60)
 //	SIM_INTERVAL        telemetry period                 (5s)
-//	SIM_FAULT_EVERY     mean time between new faults     (45m)
+//	SIM_FAULT_EVERY     mean time between new faults     (30m)
 //	SIM_TRIP_EVERY      mean time between trips          (4h)
 //	SIM_OFFLINE_EVERY   mean time between comm losses    (8h)
-//	SIM_MAX_FAULTS      concurrent degradations          (4)
+//	SIM_MAX_FAULTS      concurrent degradations          (6)
+//	SIM_FDD_EVERY       mean time between labelled LBNL faults (12h; 0 = off)
 //	SIM_RAMP_MIN/MAX    minutes for a fault to develop   (20 / 60)
 //	SIM_WORKFORCE       simulate the maintenance team    (true)
 //	SIM_APPROVE_DELAY   idle time before the team acts   (15m)
 //	SIM_JOBS            run digital twin simulation jobs (true)
+//	SIM_DEMO_AI         seed the demo AI records once the analytics service is up (true)
 //	SIM_TRANSPORT       mqtt (the backend's broker) | http (REST push gateways, for the cloud) (mqtt)
 //	API_VERIFY_TLS      verify the backend's certificate (false: local self-signed)
 //	DEFAULT_TIMEZONE    plant time zone                  (Asia/Singapore)
@@ -62,7 +66,10 @@ const seedKey = "demo_seed"
 // codes, SOPs, technicians, the full product routes.
 // 9: furnace monitor wafer adders, dielectric etch wall temperature, plating
 // current and support unit limits.
-const seedVersion = 9
+// 10: extended AFDD issue mapping: a compound diagnosis per degradation of
+// the process tools, sub-fab and facility units (content_afdd.go) with its
+// code, SOPs and alarm mapping.
+const seedVersion = 10
 
 // historyVersion is bumped when the generated history must be regenerated
 // (e.g. new equipment that needs history); this replaces all demo history and
@@ -82,7 +89,11 @@ const seedVersion = 9
 // 10: planned cycle times (26 / 30 days) the lots are scheduled against.
 // 11: simulated overhead transport (OHT vehicles, stockers, transfer
 // records) sets when each lot reaches its tool.
-const historyVersion = 11
+// 12: the extended diagnoses, compound orders listing their symptom codes,
+// denser degradations, LBNL episodes in the last week and two still running.
+// 13: maintenance and trips keep the duty chillers available (no more periods
+// with every chiller down).
+const historyVersion = 13
 
 // faultCatalogKey is the core.settings key of the fault catalog the simulator
 // publishes for the backend (fault injection and simulation job validation).
@@ -104,6 +115,14 @@ func env(key, def string) string {
 
 func envDur(key string, def time.Duration) time.Duration {
 	if d, err := time.ParseDuration(env(key, "")); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// envDurZero is envDur that also accepts 0 (off).
+func envDurZero(key string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(env(key, "")); err == nil && d >= 0 {
 		return d
 	}
 	return def
@@ -183,13 +202,15 @@ func run(ctx context.Context, cmd string) error {
 		return doRun(ctx, db, client, loc, seed)
 	case "history":
 		return doHistory(ctx, db, client, loc, seed)
+	case "demo-ai":
+		return seedDemoAI(ctx, db, loc, true)
 	case "start":
 		if err := doSeed(ctx, db, client, loc, seed); err != nil {
 			return err
 		}
 		return doRun(ctx, db, client, loc, seed)
 	}
-	return fmt.Errorf("unknown command %q (use start, seed or run)", cmd)
+	return fmt.Errorf("unknown command %q (use start, seed, run, history or demo-ai)", cmd)
 }
 
 // httpLink is the HTTPS transport (SIM_TRANSPORT=http), nil for MQTT.
@@ -290,6 +311,11 @@ func doSeed(ctx context.Context, db *pgxpool.Pool, c *Client, loc *time.Location
 			return err
 		}
 	}
+	// The AI analytics service builds its document corpus (manuals, reports,
+	// SOPs) from the plant; on a fresh deployment it started before this seed.
+	if _, err := db.Exec(ctx, `SELECT pg_notify('rag_corpus', '')`); err != nil {
+		slog.Warn("notify rag_corpus", "err", err)
+	}
 	slog.Info("demo plant ready")
 	return nil
 }
@@ -326,9 +352,10 @@ func doRun(ctx context.Context, db *pgxpool.Pool, c *Client, loc *time.Location,
 	}
 	opts := LiveOptions{
 		MQTTURL: env("MQTT_URL", "tcp://backend:1883"), HTTP: httpLink, Org: env("ORG_ALIAS", "local"), Prj: env("PROJECT_ALIAS", "digital_twin_afdd"),
-		Interval: envDur("SIM_INTERVAL", 5*time.Second), FaultEvery: envDur("SIM_FAULT_EVERY", 45*time.Minute),
+		Interval: envDur("SIM_INTERVAL", 5*time.Second), FaultEvery: envDur("SIM_FAULT_EVERY", 30*time.Minute),
 		TripEvery: envDur("SIM_TRIP_EVERY", 4*time.Hour), OfflineEvry: envDur("SIM_OFFLINE_EVERY", 8*time.Hour),
-		MaxFaults: envInt("SIM_MAX_FAULTS", 4), RampMin: envFloat("SIM_RAMP_MIN", 20), RampMax: envFloat("SIM_RAMP_MAX", 60),
+		MaxFaults: envInt("SIM_MAX_FAULTS", 6), RampMin: envFloat("SIM_RAMP_MIN", 20), RampMax: envFloat("SIM_RAMP_MAX", 60),
+		FDDEvery: envDurZero("SIM_FDD_EVERY", 12*time.Hour),
 	}
 	// Faults carried over from the history develop at history speed (days);
 	// bring them to the live pace so they surface within the session. Fixed-
@@ -357,6 +384,9 @@ func doRun(ctx context.Context, db *pgxpool.Pool, c *Client, loc *time.Location,
 		runner := newJobRunner(ctx, db, loc, live.Snapshot, jobOptions(opts))
 		go runner.Run()
 		slog.Info("simulation job runner enabled")
+	}
+	if strings.EqualFold(env("SIM_DEMO_AI", "true"), "true") {
+		startDemoAI(ctx, db, loc)
 	}
 	slog.Info("live simulation started", "equipment", len(plant.Assets), "mqtt", opts.MQTTURL, "interval", opts.Interval)
 	return live.Run()
