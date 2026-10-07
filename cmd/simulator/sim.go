@@ -151,19 +151,7 @@ func (p *Plant) updateDuty(t time.Time) {
 		}
 		return running
 	}
-	// A chiller can only run with its dedicated CHW and CW pumps available
-	// (evaporator / condenser flow switch interlocks); otherwise the standby
-	// chiller takes over.
-	chwp, cwp := p.group("chwp"), p.group("cwp")
-	pumpsOK := func(a *Asset) bool {
-		for _, g := range [][]*Asset{chwp, cwp} {
-			if a.Index < len(g) && (g[a.Index].Trip || g[a.Index].Maint) {
-				return false
-			}
-		}
-		return true
-	}
-	ch := assign("chillers", p.dutyChillers(), pumpsOK)
+	ch := assign("chillers", p.dutyChillers(), p.pumpsOK)
 	assign("towers", ch, nil)
 	assign("pcw", 3, nil)
 	// Dedicated primary pumps: CHWP-0n / CWP-0n run with chiller CH-0n.
@@ -184,6 +172,42 @@ func (p *Plant) updateDuty(t time.Time) {
 	for _, a := range p.group("tool") {
 		a.Duty, a.Interlock = true, supportInterlock(a)
 	}
+}
+
+// pumpsOK reports whether a chiller's dedicated CHW and CW pumps are
+// available: a chiller can only run with both (evaporator / condenser flow
+// switch interlocks); otherwise the standby chiller takes over.
+func (p *Plant) pumpsOK(a *Asset) bool {
+	for _, g := range []string{"chwp", "cwp"} {
+		if pumps := p.group(g); a.Index < len(pumps) && (pumps[a.Index].Trip || pumps[a.Index].Maint) {
+			return false
+		}
+	}
+	return true
+}
+
+// canStop reports whether a unit can stop (maintenance, a trip) without
+// leaving the duty controller short: a chiller, its dedicated pump or a tower
+// stops only while the other available chillers / towers still cover the
+// duty chillers. A unit already out of the count (tripped, in maintenance,
+// its chiller's pump down) and the units without standby always can.
+func (p *Plant) canStop(a *Asset) bool {
+	g := a.Spec.Group
+	switch g {
+	case "chwp", "cwp":
+		g = "chillers"
+	case "chillers", "towers":
+	default:
+		return true
+	}
+	ok := func(b *Asset) bool { return !b.Trip && !b.Maint && (g != "chillers" || p.pumpsOK(b)) }
+	members, n := p.group(g), 0
+	for _, b := range members {
+		if ok(b) {
+			n++
+		}
+	}
+	return a.Index >= len(members) || !ok(members[a.Index]) || n-1 >= p.dutyChillers()
 }
 
 // Step advances the plant by dt seconds to t and returns the measured values
@@ -293,11 +317,12 @@ func (p *Plant) injectRandomFault(r *rand.Rand, now time.Time, rampMin, rampMax 
 	return nil, nil, 0
 }
 
-// injectRandomTrip makes a random running asset spike and trip 45 s later.
+// injectRandomTrip makes a random running asset spike and trip 45 s later; a
+// chiller, its pump or a tower only while a standby can take over (canStop).
 func (p *Plant) injectRandomTrip(r *rand.Rand, now time.Time) *Asset {
 	for tries := 0; tries < 20; tries++ {
 		a := p.Assets[r.IntN(len(p.Assets))]
-		if !a.Running() || a.Trip || len(a.Model.Trips) == 0 {
+		if !a.Running() || a.Trip || len(a.Model.Trips) == 0 || !p.canStop(a) {
 			continue
 		}
 		a.startTrip(now)

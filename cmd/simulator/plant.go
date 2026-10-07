@@ -930,7 +930,7 @@ func models() []*ModelSpec {
 			map[string]CondSpec{"VAC-002": gt("body_temp", 115, false)}),
 	}
 	out = append(out, subFabModels()...)
-	return append(out, processToolModels()...)
+	return addDiagnoses(append(out, processToolModels()...))
 }
 
 // ---------------------------------------------------------------------------
