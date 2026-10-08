@@ -80,7 +80,14 @@ func (s *Service) CreateEarlyWarning(ctx context.Context, ew engine.EarlyWarning
 		if err != nil {
 			return err
 		}
-		if err := setIssues(ctx, tx, id, []int64{ew.TargetCodeID}, ew.OtherCodeIDs); err != nil {
+		main := []int64{ew.TargetCodeID}
+		if ew.IsCompound {
+			// a compound warning lists the alarm codes of its symptoms as issues too
+			for _, c := range ew.SourceCodes {
+				main = append(main, c.CodeID)
+			}
+		}
+		if err := setIssues(ctx, tx, id, main, ew.OtherCodeIDs); err != nil {
 			return err
 		}
 		status := strings.ToUpper(ew.Severity)
@@ -90,6 +97,21 @@ func (s *Service) CreateEarlyWarning(ctx context.Context, ew engine.EarlyWarning
 		if _, err := tx.Exec(ctx, `UPDATE dm.maintenance_order_issues SET alarm_status = $3, detected_at = $4 WHERE order_id = $1 AND alarm_code_id = $2`,
 			id, ew.TargetCodeID, status, ew.DetectedAt); err != nil {
 			return err
+		}
+		if ew.IsCompound {
+			for _, c := range ew.SourceCodes {
+				if c.CodeID == ew.TargetCodeID {
+					continue
+				}
+				st := strings.ToUpper(c.Severity)
+				if st == "" {
+					st = "WARNING"
+				}
+				if _, err := tx.Exec(ctx, `UPDATE dm.maintenance_order_issues SET alarm_status = $3, detected_at = $4 WHERE order_id = $1 AND alarm_code_id = $2 AND NOT is_other`,
+					id, c.CodeID, st, ew.DetectedAt); err != nil {
+					return err
+				}
+			}
 		}
 		for _, p := range ew.Parameters {
 			if _, err := tx.Exec(ctx, `INSERT INTO dm.maintenance_order_parameters (order_id, equipment_parameter_id, condition, message, detected_at)
