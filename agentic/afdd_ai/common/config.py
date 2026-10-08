@@ -61,11 +61,13 @@ class Settings:
     model_lite: str
     embed_model: str
     embed_dim: int
+    # Daily Gemini spend cap (plant time zone); 0 = no limit.
     daily_budget_usd: float
-    # Each user's own assistant spend per day (plant time zone).
+    # Each user's own assistant spend per day (plant time zone); 0 = no limit.
     user_daily_budget_usd: float
     # Part of the daily budget kept for background analytics (fault
-    # instructions, embeddings): agent turns stop at daily - reserve.
+    # instructions, embeddings): agent turns stop at daily - reserve (unused
+    # when the daily budget is 0).
     analytics_reserve_usd: float
     max_llm_calls: int
     thinking_budget_root: int

@@ -2,7 +2,8 @@
 
 The API key has a small budget, so every model call is priced and recorded in
 `analytics.llm_usage`, and calls are refused once today's spend (plant time zone)
-reaches `AI_DAILY_BUDGET_USD`. Thinking tokens are billed as output.
+reaches `AI_DAILY_BUDGET_USD` (0 = no limit; usage is still recorded). Thinking
+tokens are billed as output.
 
 Non-agent components (fault instructions, embeddings) use the helpers here; the
 ADK agent records its usage through `record_usage` from a model callback.
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -104,10 +106,12 @@ async def spent_today_usd(user_id: int | None = None) -> float:
 
 async def check_budget(planned_usd: float = 0.0) -> None:
     """Raise unless today's spend is below the daily budget and the planned
-    cost of the next call(s) still fits in it."""
+    cost of the next call(s) still fits in it (a budget of 0 = no limit)."""
     s = get_settings()
     if not s.gemini_configured:
         raise GeminiNotConfigured("Gemini is not configured (GOOGLE_API_KEY)")
+    if s.daily_budget_usd <= 0:
+        return
     spent = await spent_today_usd()
     if spent >= s.daily_budget_usd:
         raise BudgetExceeded(f"Daily AI budget reached (US${spent:.3f} of US${s.daily_budget_usd:.2f}); try again tomorrow")
@@ -254,6 +258,18 @@ async def embed_texts(
     return out
 
 
+_RETRY_DELAY = re.compile(r"retry(?:Delay': '| in )(\d+(?:\.\d+)?)s")
+
+
+def rate_limit_wait(err: Exception) -> float | None:
+    """Seconds a 429 asks to wait (RetryInfo); None when err is not a rate limit. The free tier
+    answers about a minute for its 100 embed requests/min and hours for its 1,000 a day."""
+    if getattr(err, "code", None) != 429:
+        return None
+    m = _RETRY_DELAY.search(str(err))
+    return float(m.group(1)) if m else 60.0
+
+
 async def _embed_call(texts: list[str], cfg: types.EmbedContentConfig, attempts: int = 4) -> list[list[float]]:
     s = get_settings()
     delay = 2.0
@@ -265,9 +281,13 @@ async def _embed_call(texts: list[str], cfg: types.EmbedContentConfig, attempts:
                 raise RuntimeError(f"embedding count {len(vecs)} != {len(texts)}")
             return [_normalise(v) for v in vecs]
         except Exception as err:  # noqa: BLE001 - retry rate limits / transient errors
-            if attempt == attempts - 1:
-                raise
-            log.warning("embed retry %s: %s", attempt + 1, err)
-            await asyncio.sleep(delay)
+            wait = rate_limit_wait(err)
+            if attempt == attempts - 1 or (wait is not None and wait > 90):
+                raise  # out of attempts, or a daily quota (hours away): the caller defers or fails fast
+            # A per-minute quota names its own wait: background document embedding waits that long
+            # (sooner only fails again); a search query keeps the short backoff.
+            pause = max(delay, wait) if wait is not None and cfg is not None and cfg.task_type == "RETRIEVAL_DOCUMENT" else delay
+            log.warning("embed retry %s in %.0f s: %s", attempt + 1, pause, err)
+            await asyncio.sleep(pause)
             delay *= 2
     return []
