@@ -139,7 +139,7 @@ UNIT_SPANS: dict[str, tuple[float, float]] = {
     "bar(g)": (-1.0, 40.0),
     "mbar": (0.0, 2000.0),
     "Pa": (-50.0, 5000.0),
-    "A": (0.0, 5000.0),
+    "A": (-1.0, 5000.0),  # zero offset of a current sensor at no load (sample at a tool's stop)
     "Hz": (0.0, 70.0),
     "kW": (-50.0, 20000.0),
     "kW/RT": (0.0, 3.0),
@@ -147,21 +147,32 @@ UNIT_SPANS: dict[str, tuple[float, float]] = {
     "mm/s": (0.0, 50.0),
     "µS/cm": (0.0, 10000.0),
     "l/min": (0.0, 1000.0),
-    "slm": (0.0, 1000.0),
+    "slm": (-1.0, 1000.0),  # zero offset of a mass flow sensor at no flow
     "Nm³/min": (0.0, 500.0),
     "kWh/m³": (0.0, 5.0),
 }
-# Parameters whose physics leaves the generic span of their unit.
-ALIAS_SPANS: dict[str, tuple[float, float]] = {
-    "hp_elem_temp": (0.0, 260.0),  # compressor element outlet
-    "lp_elem_temp": (0.0, 260.0),
-    "dew_point": (-80.0, 30.0),  # pressure dew point of dried air
-    "body_temp": (0.0, 200.0),  # dry pump body
-    "discharge_temp": (-10.0, 130.0),
-    "motor_temp": (-10.0, 160.0),
-    "bearing_temp": (-10.0, 130.0),
-    "oil_temp": (-10.0, 120.0),
-    "intercooler_temp": (-10.0, 120.0),
+# Parameters whose physics leaves the generic span of their unit, by (alias, unit): one alias can be
+# a different reading on another model (scrubber inlet in Pa, dry pump inlet in mbar). Hand-kept:
+# the model parameters carry no physical limits (control_min / control_max only on set points).
+ALIAS_SPANS: dict[tuple[str, str], tuple[float, float]] = {
+    ("hp_elem_temp", "°C"): (0.0, 260.0),  # compressor element outlet
+    ("lp_elem_temp", "°C"): (0.0, 260.0),
+    ("dew_point", "°C"): (-80.0, 30.0),  # pressure dew point of dried air
+    ("body_temp", "°C"): (0.0, 200.0),  # dry pump body
+    ("discharge_temp", "°C"): (-10.0, 130.0),
+    ("motor_temp", "°C"): (-10.0, 160.0),
+    ("bearing_temp", "°C"): (-10.0, 130.0),
+    ("oil_temp", "°C"): (-10.0, 120.0),
+    ("intercooler_temp", "°C"): (-10.0, 120.0),
+    # process tools and abatement
+    ("burner_temp", "°C"): (0.0, 1300.0),  # scrubber combustion chamber
+    ("inlet_press", "Pa"): (-2500.0, 500.0),  # scrubber inlet: suction on the tool exhaust
+    ("tube_temp", "°C"): (0.0, 1300.0),  # diffusion / LPCVD furnace
+    ("peak_temp", "°C"): (0.0, 1300.0),  # RTP spike anneal
+    ("heater_temp", "°C"): (0.0, 600.0),  # PECVD heater
+    ("substrate_temp", "°C"): (0.0, 600.0),  # PVD substrate heater
+    ("chuck_temp", "°C"): (-10.0, 400.0),  # asher hot chuck, prober chuck
+    ("peb_temp", "°C"): (0.0, 250.0),  # track post-exposure bake plate
 }
 
 
@@ -178,7 +189,7 @@ class ParamMeta:
 
     @property
     def span(self) -> tuple[float, float] | None:
-        return ALIAS_SPANS.get(self.alias) or UNIT_SPANS.get(self.unit)
+        return ALIAS_SPANS.get((self.alias, self.unit)) or UNIT_SPANS.get(self.unit)
 
     def fmt(self, v: float | None) -> str:
         if v is None or not math.isfinite(v):

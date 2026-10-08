@@ -226,6 +226,38 @@ def test_eligibility_and_param_meta():
     assert TEMP.resolution == 0.01 and TEMP.fmtu(6.5) == "6.50 °C"
 
 
+# Normal readings of the twin's process tools and abatement (cmd/simulator tools.go, fabplant.go): idle to
+# recipe extremes, fault effects and interlock trips; the zero offset of a current or flow at a tool's stop.
+@pytest.mark.parametrize(
+    ("alias", "unit", "lo", "hi"),
+    [
+        ("burner_temp", "°C", 40.0, 871.0),  # scrubber cooling down .. combustion chamber
+        ("inlet_press", "Pa", -475.0, -15.0),  # scrubber inlet suction
+        ("tube_temp", "°C", 400.0, 1100.5),  # furnace ALLOY .. WELL recipe
+        ("peak_temp", "°C", 30.0, 1054.0),  # RTP between wafers .. spike anneal
+        ("heater_temp", "°C", 388.0, 401.0),  # PECVD heater drift
+        ("substrate_temp", "°C", 20.0, 206.0),  # PVD
+        ("chuck_temp", "°C", 25.0, 290.0),  # prober .. asher over-temperature trip
+        ("peb_temp", "°C", 109.7, 118.0),  # track hot plate, over-temperature trip
+        ("arc_current", "A", -0.15, 3.4),  # implanter source
+        ("plating_current", "A", -0.02, 12.2),
+        ("gas_flow", "slm", -0.5, 10.5),  # furnace process gas
+    ],
+)
+def test_process_tool_readings_are_inside_their_physical_span(alias, unit, lo, hi):
+    meta = anomaly.ParamMeta(alias, alias, unit, 1)
+    x = np.linspace(lo, hi, 60)
+    assert anomaly.detect_range(x, np.ones(60), meta, np.arange(60)) == []
+
+
+def test_alias_span_is_per_unit_and_still_catches_a_failed_sensor():
+    assert anomaly.ParamMeta("inlet_press", "Inlet Static Pressure", "Pa", 0).span == (-2500.0, 500.0)
+    assert PRESS.span == anomaly.UNIT_SPANS["mbar"]  # the dry pump inlet of the same alias
+    tube = anomaly.ParamMeta("tube_temp", "Tube Temperature", "°C", 1)
+    hits = anomaly.detect_range(np.array([900.0, 1500.0, -20.0]), np.ones(3), tube, np.arange(3))
+    assert [(h.idx, h.severity) for h in hits] == [(1, "CRITICAL"), (2, "CRITICAL")]
+
+
 def test_clear_window_is_longer_for_spc():
     assert anomaly.clear_minutes("zscore") == 15
     assert anomaly.clear_minutes("spc") == 30
