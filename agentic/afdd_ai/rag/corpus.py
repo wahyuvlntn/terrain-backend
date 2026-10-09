@@ -14,7 +14,10 @@ Document kinds (all `source = 'generated'`, A4, fpdf2 + DejaVu Sans):
   values before / after the work, downtime), work notes, instructions
   performed, KPIs; doc_date = completion date;
 * ``setpoint_log`` - one per month: operator set-point changes
-  (asset.control_requests) and applied optimizer recommendations.
+  (asset.control_requests) and applied optimizer recommendations;
+* ``sop`` - one per AFDD diagnosis code (the target of an issue relation):
+  the relations that raise it per model, the related variables and its
+  Diagnostic / Repair / Severity procedures.
 
 Idempotency: every document has a unique `metadata.generator_key`; the
 source data is hashed (`metadata.source_hash`) and a document is re-rendered,
@@ -51,7 +54,7 @@ from .pdf import DocPDF
 log = logging.getLogger(__name__)
 
 CORPUS_VERSION = 1  # bump to re-render every generated document (layout changes)
-KINDS = ("manual", "fdd_reference", "maintenance_report", "setpoint_log")
+KINDS = ("manual", "fdd_reference", "maintenance_report", "setpoint_log", "sop")
 STATUS_DONE, STATUS_CLOSED = 5, 6
 
 # Design data of the modelled equipment (simulator plant definition; not stored in the DB).
@@ -1019,6 +1022,118 @@ def render_setpoint_log(src: dict[str, Any]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Diagnosis SOPs
+
+
+async def collect_sops(site: str) -> list[DocSpec]:
+    relations = await db.fetch_all(
+        """SELECT ir.name, ir.flow, m.id AS model_id, m.name AS model_name, ty.name AS type_name
+           FROM dm.issue_relations ir JOIN asset.models m ON m.id = ir.model_id JOIN asset.types ty ON ty.id = m.type_id
+           WHERE m.id IN (SELECT model_id FROM analytics.v_assets WHERE site_code = %s) ORDER BY m.name, ir.name""",
+        (site,),
+    )
+    by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in relations:
+        for n in (r["flow"] or {}).get("nodes", []):
+            code = (n.get("data") or {}).get("code")
+            if n.get("type") == "target" and code:
+                by_code[code].append(r)
+    if not by_code:
+        return []
+    codes = list(by_code)
+    names = {r["code"]: r["name"] for r in await db.fetch_all("SELECT code, name FROM dm.alarm_codes WHERE code = ANY(%s)", (codes,))}
+    instructions = await db.fetch_all(
+        """SELECT DISTINCT ON (i.id) i.id, ac.code, i.title, it.name AS type, i.instruction_type_id, i.duration, i.description, i.content
+           FROM dm.instructions i JOIN dm.alarm_codes ac ON ac.id = i.alarm_code_id JOIN dm.instruction_types it ON it.id = i.instruction_type_id
+           WHERE ac.code = ANY(%s) AND NOT i.is_deleted ORDER BY i.id""",
+        (codes,),
+    )
+    mappings = await db.fetch_all(
+        """SELECT ac.code, m.name AS model_name, string_agg(DISTINCT mp.name, ', ') AS params
+           FROM dm.alarm_mappings am JOIN dm.alarm_codes ac ON ac.id = am.alarm_code_id JOIN asset.models m ON m.id = am.model_id
+           JOIN asset.model_parameters mp ON mp.id = am.model_parameter_id WHERE ac.code = ANY(%s) GROUP BY 1, 2 ORDER BY 1, 2""",
+        (codes,),
+    )
+    out = []
+    for code in sorted(codes):
+        rels = by_code[code]
+        types = sorted({r["type_name"] for r in rels})
+        models = sorted({r["model_name"] for r in rels})
+        model_ids = {r["model_id"] for r in rels}
+        inputs = {
+            part.split()[1] for r in rels for path in render_flow(r["flow"])[1] for part in path.split(" AND ") if part.startswith("alarm ")
+        }
+        source = {
+            "code": code,
+            "name": names.get(code, code),
+            "types": types,
+            "models": models,
+            "relations": [{"name": r["name"], "model": r["model_name"], "flow": r["flow"]} for r in rels],
+            "mappings": [m for m in mappings if m["code"] == code],
+            "instructions": sorted((i for i in instructions if i["code"] == code), key=lambda i: (i["instruction_type_id"], i["title"])),
+            "site": site,
+        }
+        out.append(
+            DocSpec(
+                key=f"sop:{site}:{slug(code)}",
+                doc_type="sop",
+                title=f"{code} {names.get(code, code)} - Diagnosis and repair SOP",
+                object_key=f"generated/sop/{site.lower()}/{slug(code)}.pdf",
+                site_code=site,
+                source=source,
+                render=render_sop,
+                asset_type=types[0] if len(types) == 1 else None,
+                model_id=next(iter(model_ids)) if len(model_ids) == 1 else None,
+                alarm_codes=[code, *sorted(inputs - {code})],
+                meta={"code": code, "models": models},
+            )
+        )
+    return out
+
+
+def render_sop(src: dict[str, Any]) -> bytes:
+    pdf = DocPDF(
+        f"{src['code']} {src['name']}",
+        f"AFDD diagnosis and repair procedure | {', '.join(src['types'])} | Site {src['site']}",
+        site=src["site"],
+        generated_at=datetime.now(timezone.utc),
+    )
+    pdf.h1("Issue code")
+    pdf.kv([("Code", src["code"]), ("Diagnosis", src["name"]), ("Equipment types", ", ".join(src["types"])), ("Models", ", ".join(src["models"]))])
+    pdf.h1("Detection")
+    pdf.para(
+        "The evaluation engine raises an early warning (a corrective maintenance order carrying this code and its procedures) when one "
+        "of the following issue relations fires. A condition joined with AND is a compound early warning: all of its symptoms must be "
+        "present together, and its order lists the alarm codes of the symptoms as issues as well. A condition on an abnormal parameter "
+        "is a degradation: the order shows the parameter trend and its SPC chart."
+    )
+    for r in src["relations"]:
+        _, paths = render_flow(r["flow"])
+        pdf.h2(f"{r['model']} - {r['name']}")
+        pdf.bullets(paths, numbered=True)
+    if src["mappings"]:
+        pdf.h2("Related variables")
+        pdf.data_table(["Model", "Variables"], [[m["model_name"], m["params"]] for m in src["mappings"]], widths=(0.35, 0.65))
+    pdf.h1("Procedures")
+    if src["instructions"]:
+        for i in src["instructions"]:
+            pdf.h2(f"{i['type']}: {i['title']}")
+            pdf.para(f"Estimated duration: {i['duration']} min. {i['description'] or ''}".strip())
+            pdf.markdown(i["content"] or "")
+    else:
+        pdf.para("No procedures are registered for this code yet; follow the equipment manual.")
+    pdf.h1("Work report")
+    pdf.bullets(
+        [
+            "Record the readings taken during the diagnosis in the work report of the order.",
+            "Mark the diagnosis valid when the findings confirm it, invalid otherwise, and say what was found instead.",
+            "After the repair, confirm the alarm and the abnormal parameters have cleared before completing the order.",
+        ]
+    )
+    return pdf.render()
+
+
+# ---------------------------------------------------------------------------
 # Publication
 
 
@@ -1027,6 +1142,7 @@ COLLECTORS: dict[str, Callable[[str], Any]] = {
     "fdd_reference": collect_fdd_reference,
     "maintenance_report": collect_reports,
     "setpoint_log": collect_setpoint_logs,
+    "sop": collect_sops,
 }
 
 

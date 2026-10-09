@@ -14,6 +14,8 @@ transaction with the document's metadata denormalised onto every chunk.
   `gemini.embed_texts`), or Gemini not configured -> the document goes back to
   PENDING (error holds the reason) and ingestion pauses (`Deferred`), so the
   library is indexed once the budget allows.
+* A Gemini rate limit (429) still hit after the retries defers like the budget;
+  documents an older build marked FAILED for it are re-queued.
 * INDEXING rows left behind by a crash are re-queued after STALE_INDEXING.
 * A document replaced or deleted while it was being embedded keeps its new
   state: the result is dropped (claim token = updated_at).
@@ -46,7 +48,8 @@ class Deferred(Exception):
 
 async def requeue_stale() -> int:
     return await db.execute(
-        "UPDATE rag.documents SET status = 'PENDING', updated_at = now() WHERE status = 'INDEXING' AND updated_at < now() - %s",
+        "UPDATE rag.documents SET status = 'PENDING', updated_at = now()"
+        " WHERE (status = 'INDEXING' AND updated_at < now() - %s) OR (status = 'FAILED' AND error LIKE 'embedding failed: 429%%')",
         (STALE_INDEXING,),
     )
 
@@ -132,6 +135,9 @@ async def ingest(doc: dict[str, Any]) -> int:
         await _defer(doc_id, f"waiting to index: {err}")
         raise Deferred(str(err)) from err
     except Exception as err:  # noqa: BLE001 - recorded on the document
+        if gemini.rate_limit_wait(err) is not None:
+            await _defer(doc_id, f"waiting to index: Gemini rate limit ({str(err)[:200]})")
+            raise Deferred("Gemini rate limit") from err
         await _fail(doc_id, f"embedding failed: {str(err)[:300]}")
         return 0
     sha = hashlib.sha256(blob).hexdigest()
