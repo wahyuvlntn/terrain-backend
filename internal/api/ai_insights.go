@@ -28,7 +28,7 @@ import (
 // human decisions (apply / dismiss a recommendation, rule changes).
 
 const (
-	recDefaultBudgetUSD = 0.50 // AI_DAILY_BUDGET_USD default of the AI services
+	recDefaultBudgetUSD = 0.50 // AI_DAILY_BUDGET_USD default of the AI services (when unset)
 	optimizerMinPeriod  = 60   // minutes (OPTIMIZER_INTERVAL_MIN 60..120)
 	optimizerMaxPeriod  = 120
 	// optimizerStaleAfter is the age of a PENDING (created) or RUNNING
@@ -537,10 +537,11 @@ func (s *Server) aiRunOptimizer(c *Ctx) (any, error) {
 // Overview
 // ---------------------------------------------------------------------------
 
-// dailyBudgetUSD is the AI services' daily Gemini budget (AI_DAILY_BUDGET_USD).
+// dailyBudgetUSD is the AI services' daily Gemini budget (AI_DAILY_BUDGET_USD);
+// 0 = no limit and is passed through as limit_usd 0 (the UI shows only the spend).
 func dailyBudgetUSD() float64 {
-	if v, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv("AI_DAILY_BUDGET_USD")), 64); err == nil && v >= 0 {
-		return v
+	if v, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv("AI_DAILY_BUDGET_USD")), 64); err == nil && !math.IsNaN(v) {
+		return max(v, 0) // the AI services treat a negative budget as no limit too
 	}
 	return recDefaultBudgetUSD
 }
