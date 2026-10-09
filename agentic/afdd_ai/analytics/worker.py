@@ -14,7 +14,7 @@ One asyncio process runs every analytics task as an independent loop:
 | surrogate     | NOTIFY sim_jobs (+600 s poll)             | analytics/surrogate.py         |
 | calibration   | NOTIFY sim_jobs (+600 s poll)             | analytics/calibration.py       |
 | simpost       | NOTIFY sim_jobs (+10 s poll)              | analytics/simpost.py           |
-| corpus        | on start, daily                           | rag/corpus.py                  |
+| corpus        | on start, daily, NOTIFY rag_corpus        | rag/corpus.py                  |
 | ingest        | NOTIFY rag_documents (+30 s poll)         | rag/ingest.py                  |
 
 A failing iteration is logged and the loop continues (shorter retry delay);
@@ -55,7 +55,7 @@ log = logging.getLogger("ai-analytics")
 
 SHUTDOWN_GRACE_S = 20.0
 HEALTH_INTERVAL_S = 60.0
-CHANNELS = ("sim_jobs", "rag_documents", "optimizer_runs")
+CHANNELS = ("sim_jobs", "rag_documents", "optimizer_runs", "rag_corpus")
 
 
 @dataclass
@@ -126,7 +126,8 @@ class Worker:
         self._add(Task("surrogate", self._surrogate, 600, 1800, wake_on=("sim_jobs",), initial_delay_s=40, retry_s=300))
         self._add(Task("calibration", self._calibration, 600, 900, wake_on=("sim_jobs",), initial_delay_s=45, retry_s=300))
         self._add(Task("simpost", self._simpost, 10, 1800, wake_on=("sim_jobs",), initial_delay_s=3))
-        self._add(Task("corpus", self._corpus, 86400, 3600, initial_delay_s=60, retry_s=1800))
+        # rag_corpus: the demo simulator seeded the plant (on a fresh deployment after this start)
+        self._add(Task("corpus", self._corpus, 86400, 3600, wake_on=("rag_corpus",), initial_delay_s=60, retry_s=1800))
         self._add(Task("ingest", ingest.run, 30, 1800, wake_on=("rag_documents",), initial_delay_s=8, next_delay=self._ingest_delay))
         only = enabled_tasks()
         if only is not None:

@@ -28,8 +28,8 @@ def test_every_design_task_is_scheduled(monkeypatch):
     assert "sim_jobs" in t["simpost"].wake_on and t["simpost"].interval_s == 10
     assert "rag_documents" in t["ingest"].wake_on and t["ingest"].interval_s == 30
     assert "optimizer_runs" in t["manual_runs"].wake_on
-    assert t["corpus"].interval_s == 86400 and t["expiry"].interval_s == 60
-    assert set(worker.CHANNELS) == {"sim_jobs", "rag_documents", "optimizer_runs"}
+    assert t["corpus"].interval_s == 86400 and "rag_corpus" in t["corpus"].wake_on and t["expiry"].interval_s == 60
+    assert set(worker.CHANNELS) == {"sim_jobs", "rag_documents", "optimizer_runs", "rag_corpus"}
 
 
 async def test_a_failing_iteration_does_not_stop_the_loop(monkeypatch):
