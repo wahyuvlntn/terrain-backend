@@ -189,15 +189,19 @@ ASSET_CACHE_S = 30.0
 
 
 class Api:
-    """Backend calls as the user of the current tool call."""
+    """Backend calls as the user of the current tool call.
 
-    def __init__(self, state: Mapping[str, Any]):
+    origin "agent" (default) marks the call as the assistant's; "" as the person's own (a form they
+    submitted in the chat, carried out by the service).
+    """
+
+    def __init__(self, state: Mapping[str, Any], origin: str = "agent"):
         token = st.session_token(state)
         if not token:
             raise ToolError("No user session is available for this request, so no plant data can be read. Ask the user to sign in again.")
         self.token = token
         self.permissions = st.state_permissions(state)
-        self._client = BackendClient(token)
+        self._client = BackendClient(token, origin=origin)
 
     def can(self, permission: str) -> bool:
         return st.has_permission(self.permissions, permission)
