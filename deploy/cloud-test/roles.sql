@@ -1,5 +1,5 @@
--- The login roles of the GCP deployment (stage 03 creates them on AlloyDB with
--- generated passwords; these are throwaway local test values).
+-- The login roles of the GCP deployment (stage 05 creates them on Cloud SQL with
+-- deployment/gcp/db-tools/sql/roles.sql and generated passwords; these are throwaway local test values).
 DO $roles$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'afdd_api') THEN
