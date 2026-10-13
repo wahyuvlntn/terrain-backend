@@ -4,9 +4,11 @@
     ├── insight_agent (fast, AI_THINKING_BUDGET_FAST): backend API tools, charts, RAG,
     │   McpToolset -> afdd-db, open_in_app, deep_analyst as a single-turn agent tool
     │   └── deep_analyst (pro model, AI_THINKING_BUDGET_PRO, mode single_turn)
-    └── twin_agent (fast, AI_THINKING_BUDGET_FAST): McpToolset -> afdd-twin, RAG, open_in_app
+    ├── twin_agent (fast, AI_THINKING_BUDGET_FAST): McpToolset -> afdd-twin, simulation forms, RAG, open_in_app
+    └── maintenance_agent (fast, AI_THINKING_BUDGET_FAST): maintenance order tools (create, edit,
+        workflow actions; forms when a request is incomplete), order and early-warning reads, open_in_app
 
-The root and its two specialists are chat-mode agents (ADK transfers the
+The root and its three specialists are chat-mode agents (ADK transfers the
 conversation between them). deep_analyst is a `single_turn` sub-agent of the
 insight agent: ADK exposes it to its parent as an agent tool
 (`_SingleTurnAgentTool`, an `AgentTool`) that runs one isolated turn on the
@@ -35,7 +37,7 @@ from google.genai import types
 from ..common import gcp
 from ..common.config import Settings, get_settings
 from ..common.gemini import sampling_temperature, thinking_config
-from . import budget, charts, context, navigation, prompts, rag_tool, tools_backend
+from . import budget, charts, context, navigation, prompts, rag_tool, simforms, tools_backend, tools_maintenance
 from . import state as st
 
 log = logging.getLogger(__name__)
@@ -44,8 +46,9 @@ APP_NAME = "afdd_plant_assistant"
 ROOT = "plant_assistant"
 INSIGHT = "insight_agent"
 TWIN = "twin_agent"
+MAINTENANCE = "maintenance_agent"
 DEEP = "deep_analyst"
-AGENT_NAMES = (ROOT, INSIGHT, TWIN, DEEP)
+AGENT_NAMES = (ROOT, INSIGHT, TWIN, MAINTENANCE, DEEP)
 # Agents whose text is tool output for another agent, not an answer to the user.
 INTERNAL_AGENTS = frozenset({DEEP})
 
@@ -218,7 +221,32 @@ def build_root_agent(
         ),
         model=model_for(TWIN, s.model_fast),
         instruction=prompts.twin_instruction,
-        tools=[mcp_toolset(mcp_twin_url or s.mcp_twin_url, s), rag_tool.search_documents, navigation.open_in_app],
+        tools=[
+            mcp_toolset(mcp_twin_url or s.mcp_twin_url, s),
+            *simforms.SIM_FORM_TOOLS,
+            rag_tool.search_documents,
+            navigation.open_in_app,
+        ],
+        generate_content_config=_config(s.model_fast, s.thinking_budget_fast, 4096),
+        **callbacks(s.model_fast),
+    )
+
+    maintenance = LlmAgent(
+        name=MAINTENANCE,
+        description=(
+            "Maintenance planner: creates, edits, assigns, approves, rejects, starts, pauses, resumes, "
+            "completes, closes and deletes maintenance orders for the user, with a form when details are missing."
+        ),
+        model=model_for(MAINTENANCE, s.model_fast),
+        instruction=prompts.maintenance_instruction,
+        tools=[
+            tools_backend.get_maintenance_orders,
+            tools_backend.get_maintenance_order_detail,
+            tools_backend.get_early_warnings,
+            tools_backend.list_assets,
+            *tools_maintenance.MAINTENANCE_TOOLS,
+            navigation.open_in_app,
+        ],
         generate_content_config=_config(s.model_fast, s.thinking_budget_fast, 4096),
         **callbacks(s.model_fast),
     )
@@ -229,7 +257,7 @@ def build_root_agent(
         model=model_for(ROOT, s.model_fast),
         instruction=prompts.root_instruction,
         tools=[navigation.open_in_app],
-        sub_agents=[insight, twin],
+        sub_agents=[insight, twin, maintenance],
         generate_content_config=_config(s.model_fast, s.thinking_budget_root, 1024),
         **callbacks(s.model_fast),
     )
