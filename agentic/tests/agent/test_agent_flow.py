@@ -410,15 +410,62 @@ async def test_budget_reserve_and_per_user_allowance(monkeypatch):
         # each user's own allowance; other users are not affected
         spend.update(total=0.10, user=0.20)
         code, msg = await budget.budget_refusal(TEST_USER_ID)
-        assert code == budget.USER_BUDGET_EXCEEDED and "personal AI assistant allowance for today (US$0.20 of US$0.20)" in msg
+        assert code == budget.USER_BUDGET_EXCEEDED and "personal LEVO allowance for today (US$0.20 of US$0.20)" in msg
         assert await budget.budget_refusal(TEST_USER_ID + 1) is None and await budget.budget_refusal(None) is None
         svc, models = make_service({ROOT: ["never"]})
         try:
             events = await run_turn(svc, "Hi")
         finally:
             await svc.close()
-        assert names(events) == ["error", "done"] and "personal AI assistant allowance" in events[0][1]["message"]
+        assert names(events) == ["error", "done"] and "personal LEVO allowance" in events[0][1]["message"]
         assert models[ROOT].requests == []
+    finally:
+        monkeypatch.undo()
+        get_settings.cache_clear()
+
+
+async def test_budget_zero_means_no_limit(monkeypatch):
+    spend = {"total": 100.0, "user": 100.0}
+    recorded: list[tuple[str, int | None]] = []
+
+    async def spent(user_id=None):  # noqa: ANN001
+        return spend["total"] if user_id is None else spend["user"]
+
+    async def record(component, usage, *, user_id=None, session_id=None):  # noqa: ANN001
+        recorded.append((component, user_id))
+        return usage.cost_usd
+
+    async def turn() -> list[tuple[str, Any]]:
+        svc, _ = make_service({ROOT: ["Hello."]})
+        try:
+            return await run_turn(svc, "Hi")
+        finally:
+            await svc.close()
+
+    monkeypatch.setattr(gemini, "spent_today_usd", spent)
+    monkeypatch.setattr(gemini, "record_usage", record)
+    monkeypatch.setenv("AI_DAILY_BUDGET_USD", "0")
+    monkeypatch.setenv("AI_ANALYTICS_RESERVE_USD", "0.10")  # irrelevant without a daily budget
+    monkeypatch.setenv("AI_USER_DAILY_BUDGET_USD", "0")
+    get_settings.cache_clear()
+    try:
+        assert await budget.budget_refusal(TEST_USER_ID) is None
+        events = await turn()
+        assert "error" not in names(events) and first(events, "message")["text"] == "Hello."
+        usage = first(events, "usage")
+        assert usage["limit_usd"] == 0 and usage["today_usd"] == 100.0  # the UI shows only the spend
+        assert recorded == [(budget.COMPONENT, TEST_USER_ID)]  # usage is still recorded
+        # the per-user allowance alone still applies, and is the reported limit
+        monkeypatch.setenv("AI_USER_DAILY_BUDGET_USD", "0.20")
+        get_settings.cache_clear()
+        assert (await budget.budget_refusal(TEST_USER_ID))[0] == budget.USER_BUDGET_EXCEEDED
+        spend.update(user=0.05)
+        assert await budget.budget_refusal(TEST_USER_ID) is None
+        assert first(await turn(), "usage")["limit_usd"] == 0.20
+        # a positive daily budget still refuses
+        monkeypatch.setenv("AI_DAILY_BUDGET_USD", "0.50")
+        get_settings.cache_clear()
+        assert (await budget.budget_refusal(TEST_USER_ID))[0] == budget.BUDGET_EXCEEDED
     finally:
         monkeypatch.undo()
         get_settings.cache_clear()

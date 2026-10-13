@@ -12,7 +12,9 @@ A turn runs the ADK `Runner` in SSE streaming mode with the per-request identity
 (`state.Identity.state_delta`) and the parts of the UI context the tools act on
 (twin walk mode, replayed simulation job: `navigation.ui_state`) as `temp:`
 state, and the model-call cap from `AI_MAX_LLM_CALLS`, and yields normalised SSE
-(event, data) pairs. One turn per conversation at a time: `prepare_chat` takes
+(event, data) pairs. A request that carries a submitted form (`form`, forms.py)
+first carries it out as the person (`form_result` and the result's card), then
+runs the model with the outcome as a "[Form result]" part of the user message. One turn per conversation at a time: `prepare_chat` takes
 the conversation's lock (409 when it is held) and the turn releases it when it
 ends.
 
@@ -44,10 +46,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..common import gemini
 from ..common.config import Settings, get_settings
-from . import budget, convlock, navigation, stream
+from . import budget, convlock, forms, navigation, stream
 from . import state as st
 from .backend_api import plant_tz
-from .agents import APP_NAME, DEEP, INSIGHT, ROOT, TWIN, build_root_agent
+from .agents import APP_NAME, DEEP, INSIGHT, MAINTENANCE, ROOT, TWIN, build_root_agent
 from .state import Identity
 
 log = logging.getLogger(__name__)
@@ -70,12 +72,24 @@ class ChatContext(BaseModel):
     view: str | None = None  # "walk" while the twin is in first-person walk mode
 
 
+class FormSubmission(BaseModel):
+    """A form of the conversation the user filled in and submitted (forms.py)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    form_id: str = Field(min_length=1, max_length=64)
+    kind: str = Field(min_length=1, max_length=64)
+    values: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     session_id: str | None = Field(default=None, max_length=128)
     message: str = Field(min_length=1, max_length=MAX_MESSAGE)
     context: ChatContext | None = None
+    form: FormSubmission | None = None
 
 
 class ConversationNotFound(LookupError):
@@ -130,6 +144,7 @@ class ChatTurn:
     refusal: str | None = None
     abort: asyncio.Event = field(default_factory=asyncio.Event)
     lock: Any = None  # convlock.Held: this instance's lock plus the shared lease
+    form: dict[str, Any] | None = None  # a submitted form (FormSubmission) to carry out first
 
     def __post_init__(self) -> None:
         self._unlock = weakref.finalize(self, _release_lock, self.lock) if self.lock is not None else None
@@ -163,6 +178,15 @@ class ChatTurn:
         svc = self.service
         if self.session_id:
             yield "session", {"session_id": self.session_id, "title": self.title}
+        form_note = None
+        if self.form is not None and self.session_id and not self.abort.is_set():
+            f = self.form
+            result = await forms.submit(f["kind"], f.get("values") or {}, f.get("context") or {}, self.identity.state_delta())
+            log.info("form submitted session=%s kind=%s ok=%s", self.session_id, f["kind"], result.get("ok"))
+            yield "form_result", {"form_id": f["form_id"], "ok": bool(result.get("ok")), "message": result.get("message")}
+            for item in stream.form_result_items(result):
+                yield item
+            form_note = forms.result_note(f["kind"], f["form_id"], result)
         if self.refusal is not None:
             yield "error", {"message": self.refusal}
             yield "done", {}
@@ -180,7 +204,7 @@ class ChatTurn:
                 svc.runner.run_async(
                     user_id=self.identity.username,
                     session_id=self.session_id,
-                    new_message=stream.build_user_content(self.message, self.context, datetime.now(plant_tz())),
+                    new_message=stream.build_user_content(self.message, self.context, datetime.now(plant_tz()), form_note),
                     state_delta={**self.identity.state_delta(), **navigation.ui_state(self.context)},
                     run_config=run_config,
                     abort_signal=stop,
@@ -214,13 +238,17 @@ class ChatTurn:
         today, limit = None, svc.settings.daily_budget_usd
         try:
             # report the limit that applies to this user's next turn: the assistant's share of the
-            # daily budget (minus the analytics reserve) or the user's own allowance, whichever is closer
+            # daily budget (minus the analytics reserve) or the user's own allowance, whichever is closer;
+            # a limit of 0 is off, and with both off the limit is 0 (the UI shows only the spend)
             s = svc.settings
             total = await gemini.spent_today_usd()
             mine = await gemini.spent_today_usd(self.identity.user_id)
-            shared = (total, max(0.0, s.daily_budget_usd - s.analytics_reserve_usd))
-            own = (mine, s.user_daily_budget_usd)
-            today, limit = min((shared, own), key=lambda p: p[1] - p[0])
+            pairs = []
+            if s.daily_budget_usd > 0:
+                pairs.append((total, max(0.0, s.daily_budget_usd - s.analytics_reserve_usd)))
+            if s.user_daily_budget_usd > 0:
+                pairs.append((mine, s.user_daily_budget_usd))
+            today, limit = min(pairs, key=lambda p: p[1] - p[0]) if pairs else (total, 0.0)
         except Exception:  # noqa: BLE001 - usage is informational
             log.warning("could not read today's AI spend", exc_info=True)
         yield "usage", {**usage, "today_usd": None if today is None else round(today, 4), "limit_usd": round(limit, 4)}
@@ -246,7 +274,13 @@ class AgentService:
         )
         self.root_agent = root_agent or build_root_agent(settings=self.settings)
         self.runner = Runner(app=App(name=APP_NAME, root_agent=self.root_agent), session_service=self.session_service)
-        self._models = {ROOT: self.settings.model_fast, INSIGHT: self.settings.model_fast, TWIN: self.settings.model_fast, DEEP: self.settings.model_pro}
+        self._models = {
+            ROOT: self.settings.model_fast,
+            INSIGHT: self.settings.model_fast,
+            TWIN: self.settings.model_fast,
+            MAINTENANCE: self.settings.model_fast,
+            DEEP: self.settings.model_pro,
+        }
         self._locks: dict[str, asyncio.Lock] = {}
 
     def model_of(self, agent_name: str) -> str:
@@ -311,14 +345,15 @@ class AgentService:
         if not message:
             raise ValueError("Empty message")
         context = req.context.model_dump(exclude_none=True) if req.context else None
+        form = req.form.model_dump() if req.form else None
         refusal = await budget.budget_refusal(identity.user_id)
         if req.session_id:
             session = await self._get(identity, req.session_id)
             title = str(session.state.get(st.TITLE) or "")
             if refusal is not None:
-                return ChatTurn(self, identity, session.id, title, message, context, refusal=refusal[1])
+                return ChatTurn(self, identity, session.id, title, message, context, refusal=refusal[1], form=form)
             lock = await self._acquire(session.id)
-            return ChatTurn(self, identity, session.id, title, message, context, lock=lock)
+            return ChatTurn(self, identity, session.id, title, message, context, lock=lock, form=form)
         if refusal is not None:
             # No conversation is created for a turn that cannot run.
             return ChatTurn(self, identity, None, "", message, context, refusal=refusal[1])
