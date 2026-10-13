@@ -72,24 +72,41 @@ def test_refs_are_numbered_per_answer_across_searches_and_instructions():
     from afdd_ai.agent import rag_tool
 
     state: dict = {}
-    # first search: chunks 11, 12; a relayed instruction cites chunk 12 again and chunk 30
-    assert [rag_tool.citation_ref(state, rag_tool.source_key({"chunk_id": c})) for c in (11, 12)] == [1, 2]
+
+    def ref(document_id: int, page: int, chunk_id: int) -> int:
+        return rag_tool.citation_ref(state, rag_tool.source_key({"document_id": document_id, "page": page, "chunk_id": chunk_id}))
+
+    # first search: passages on one page share a number
+    assert [ref(61, 1, 11), ref(62, 4, 12), ref(62, 4, 13)] == [1, 2, 2]
+    # a relayed instruction cites page 4 of document 62 again and two passages of a new page
     data = {
         "id": 43,
-        "instruction_md": "Isolate [1]. Check seat [2]. Verify [1-2] and [9].",
+        "instruction_md": "Isolate [1]. Check seat [2]. Verify [1-2] and [9]. Torque [1, 3].",
         "instruction_sources": json.dumps([
             {"n": 1, "chunk_id": 30, "document_id": 59, "title": "Manual", "page": 5},
             {"n": 2, "chunk_id": 12, "document_id": 62, "title": "LBNL", "page": 4},
+            {"n": 3, "chunk_id": 31, "document_id": 59, "title": "Manual", "page": 5},
         ]),
     }
     out = rag_tool.renumber_instruction(state, data)
-    assert out["instruction_md"] == "Isolate [3]. Check seat [2]. Verify [3, 2] and [9]."
-    assert [s["ref"] for s in out["instruction_sources"]] == [3, 2]
+    assert out["instruction_md"] == "Isolate [3]. Check seat [2]. Verify [3, 2] and [9]. Torque [3]."
+    assert [s["ref"] for s in out["instruction_sources"]] == [3, 2, 3]
     items = stream.instruction_source_items({"script": "ai_insights/getfault", "data": out})
     assert [c["ref"] for c in items] == [2, 3] and [c["document_id"] for c in items] == [62, 59]
-    # a later search continues the numbering and reuses known passages
-    assert rag_tool.citation_ref(state, rag_tool.source_key({"chunk_id": 30})) == 3
-    assert rag_tool.citation_ref(state, rag_tool.source_key({"chunk_id": 99})) == 4
+    # a later search continues the numbering and reuses known pages
+    assert [ref(59, 5, 40), ref(70, 2, 41)] == [3, 4]
+
+
+def test_search_citations_list_each_page_once():
+    from afdd_ai.agent import rag_tool
+
+    results = [
+        {"ref": 1, "document_id": 7, "title": "Pump manual", "page": 1, "content": "Design data"},
+        {"ref": 2, "document_id": 7, "title": "Pump manual", "page": 2, "content": "Alarms"},
+        {"ref": 1, "document_id": 7, "title": "Pump manual", "page": 1, "content": "Alarm limits"},
+    ]
+    items = rag_tool.citation_items(results)
+    assert [(c["ref"], c["page"], c["snippet"]) for c in items] == [(1, 1, "Design data"), (2, 2, "Alarms")]
 
 
 def test_format_context_strips_markup():

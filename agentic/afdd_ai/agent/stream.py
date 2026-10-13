@@ -6,7 +6,9 @@ Live (`StreamNormaliser.feed`):
 * function call                 -> `tool_call` {id, name, agent, args} (args sanitised)
 * function response             -> `tool_result` {id, name, agent, ok, summary}, plus
   `chart` (a tool's {"chart": …}), `citations` (search_documents results),
-  `simulation` (propose_simulation result) and `navigate` (open_in_app target)
+  `simulation` (propose_simulation result), `navigate` (open_in_app target),
+  `form` (a tool's {"form": …}: elicitation, forms.py) and `maintenance_order`
+  (a tool's {"maintenance_order": …}: the order card after an action)
 * author change / transfer      -> `agent` {name}
 * model error / budget refusal  -> `error` {message}
 Thought parts are never forwarded; the deep analyst's own text is internal (its
@@ -14,7 +16,9 @@ answer reaches the user through the insight agent). `session`, `usage`, `done`
 and pings are added by the service / HTTP layer.
 
 History (`history_messages`) rebuilds the same content from persisted events,
-one assistant message per invocation (user turn).
+one assistant message per invocation (user turn). A submitted form travels as a
+"[Form result]" part of the next user message (runner.ChatTurn): history marks the
+form submitted and shows the result's cards with the answer that follows.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from ..common import gemini
 from . import budget
 from .agents import INTERNAL_AGENTS
 from .charts import validate_option
+from .forms import FORM_RESULT_PREFIX, parse_result_note
 from .navigation import navigation_item
 from .rag_tool import citation_items
 
@@ -115,12 +120,16 @@ def format_context(context: Mapping[str, Any] | None, now: datetime | None = Non
     return f"{UI_CONTEXT_PREFIX} " + "; ".join(items) if items else None
 
 
-def build_user_content(message: str, context: Mapping[str, Any] | None, now: datetime | None = None) -> types.Content:
+def build_user_content(
+    message: str, context: Mapping[str, Any] | None, now: datetime | None = None, form_note: str | None = None
+) -> types.Content:
     parts = []
     line = format_context(context, now)
     if line:
         parts.append(types.Part(text=line))
     parts.append(types.Part(text=message))
+    if form_note:
+        parts.append(types.Part(text=form_note))
     return types.UserContent(parts=parts)
 
 
@@ -128,8 +137,23 @@ def user_text(content: types.Content | None) -> str:
     """The user's own text (without the UI context line)."""
     if content is None or not content.parts:
         return ""
-    texts = [p.text for p in content.parts if p.text and not p.thought and not p.text.startswith(UI_CONTEXT_PREFIX)]
+    texts = [
+        p.text
+        for p in content.parts
+        if p.text and not p.thought and not p.text.startswith(UI_CONTEXT_PREFIX) and not p.text.startswith(FORM_RESULT_PREFIX)
+    ]
     return "\n".join(texts).strip()
+
+
+def form_results(content: types.Content | None) -> list[dict[str, Any]]:
+    """The submitted-form payloads ("[Form result]" parts) of a user message."""
+    if content is None or not content.parts:
+        return []
+    out = []
+    for p in content.parts:
+        if p.text and (payload := parse_result_note(p.text)) is not None:
+            out.append(payload)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +226,10 @@ def summarise(name: str, payload: Any, ok: bool, error: str | None) -> str:
             return f"Opened: {nav['label']}"[:240]
         if name in SEARCH_TOOLS and isinstance(payload.get("results"), list):
             return f"{len(payload['results'])} document passages"
+        if (form := _form(payload)) is not None:
+            return f"Form: {form['title']}"[:240]
+        if (order := _order(payload)) is not None:
+            return f"Order {order.get('name')} {order.get('action') or ''}".strip()[:240]
         for key in ("count", "total"):
             if isinstance(payload.get(key), int):
                 return f"{payload[key]} results"
@@ -240,8 +268,22 @@ def _simulation(payload: Any) -> dict[str, Any] | None:
     }
 
 
+def _form(payload: Any) -> dict[str, Any] | None:
+    form = payload.get("form") if isinstance(payload, Mapping) else None
+    if not isinstance(form, Mapping) or not form.get("form_id") or not isinstance(form.get("fields"), list):
+        return None
+    return dict(form)
+
+
+def _order(payload: Any) -> dict[str, Any] | None:
+    order = payload.get("maintenance_order") if isinstance(payload, Mapping) else None
+    if not isinstance(order, Mapping) or order.get("id") is None:
+        return None
+    return dict(order)
+
+
 def result_items(name: str, payload: Any, ok: bool) -> list[tuple[str, dict[str, Any]]]:
-    """`chart` / `citations` / `simulation` / `navigate` events carried by one tool result."""
+    """`chart` / `citations` / `simulation` / `navigate` / `form` / `maintenance_order` events of one tool result."""
     if not ok:
         return []
     out: list[tuple[str, dict[str, Any]]] = []
@@ -257,6 +299,20 @@ def result_items(name: str, payload: Any, ok: bool) -> list[tuple[str, dict[str,
         out.append(("simulation", sim))
     if name in NAVIGATE_TOOLS and (nav := navigation_item(payload)) is not None:
         out.append(("navigate", nav))
+    if (form := _form(payload)) is not None:
+        out.append(("form", form))
+    if (order := _order(payload)) is not None:
+        out.append(("maintenance_order", order))
+    return out
+
+
+def form_result_items(result: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """The cards of a submitted form's outcome (forms.submit, or a "[Form result]" payload)."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    if (order := _order(result)) is not None:
+        out.append(("maintenance_order", order))
+    if (sim := _simulation(result.get("simulation"))) is not None:
+        out.append(("simulation", sim))
     return out
 
 
@@ -399,6 +455,8 @@ def _new_message(event: Event, role: str) -> dict[str, Any]:
         "citations": [],
         "simulations": [],
         "navigations": [],
+        "forms": [],
+        "orders": [],
         "tool_calls": [],
         "created_at": iso(event.timestamp),
     }
@@ -411,12 +469,15 @@ def history_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     current_inv: str | None = None
     texts: list[str] = []
     calls: dict[str, dict[str, Any]] = {}
+    # submitted forms: their outcome by form id, and their cards for the answer that follows
+    submitted: dict[str, dict[str, Any]] = {}
+    pending: list[tuple[str, dict[str, Any]]] = []
 
     def close() -> None:
         nonlocal current, current_inv, texts, calls
         if current is not None:
             current["text"] = "\n\n".join(t for t in texts if t.strip())
-            if current["text"] or current["tool_calls"] or current["charts"] or current["simulations"]:
+            if any(current[k] for k in ("text", "tool_calls", "charts", "simulations", "forms", "orders")):
                 messages.append(current)
         current, current_inv, texts, calls = None, None, [], {}
 
@@ -425,6 +486,10 @@ def history_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
             continue
         if ev.author == "user":
             text = user_text(ev.content)
+            for result in form_results(ev.content):
+                if result.get("form_id"):
+                    submitted[str(result["form_id"])] = {"ok": bool(result.get("ok")), "message": result.get("message")}
+                pending.extend(form_result_items(result))
             if text:
                 close()
                 msg = _new_message(ev, "user")
@@ -436,6 +501,9 @@ def history_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
         if current is None or ev.invocation_id != current_inv:
             close()
             current, current_inv = _new_message(ev, "assistant"), ev.invocation_id
+            for kind, data in pending:
+                current["orders" if kind == "maintenance_order" else "simulations"].append(data)
+            pending = []
         assert current is not None
         content = ev.content
         err = error_text(ev)
@@ -471,5 +539,12 @@ def history_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                     current["simulations"].append(data)
                 elif kind == "navigate":
                     current["navigations"].append(data)
+                elif kind == "form":
+                    current["forms"].append(data)
+                elif kind == "maintenance_order":
+                    current["orders"].append(data)
     close()
+    for msg in messages:
+        for form in msg.get("forms") or []:
+            form["submitted"] = submitted.get(str(form.get("form_id")))
     return messages
