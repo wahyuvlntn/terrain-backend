@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import date
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,11 +15,14 @@ from google.genai import types
 from afdd_ai.agent import backend_api, navigation, prompts, stream
 from afdd_ai.agent.agents import INSIGHT, ROOT, TWIN
 
-from .support import ASSETS, TOKEN, Call, FakeBackend, request_text
+from .support import ASSETS, TOKEN, Call, FakeBackend, FakeError, request_text
 from .test_agent_flow import IDENTITY, first, function_response, make_service, names, run_turn
 from .test_app_sessions import HEADERS, chat, client, scratch_db  # noqa: F401 - fixtures used by the HTTP test
 
-PERMS = ["aiassistant.read", "digitaltwin.read", "aiinsights.read", "simulation.read", "equipmentoverview.read", "alarmsreport.read"]
+PERMS = [
+    "aiassistant.read", "digitaltwin.read", "aiinsights.read", "simulation.read", "equipmentoverview.read", "alarmsreport.read",
+    "production.read", "maintenanceorder.read", "locationoverview.read", "earlywarningdiagnostics.read",
+]  # fmt: skip
 # A user whose location scope is FAB1 only (like the demo's fab facilities groups).
 FAB1_TOKEN = "tok-fab1-nav"
 FAB1_LOCATIONS = navigation.LOCATIONS[: navigation.LOCATIONS.index("MAU Plant Room South") + 1]
@@ -38,6 +42,13 @@ def locations_api(fake_backend: FakeBackend) -> Iterator[None]:
     yield
     fake_backend.handlers.pop("filter/getalllocationsandassets", None)
     fake_backend.users.pop(FAB1_TOKEN, None)
+
+
+@pytest.fixture
+def today(monkeypatch: pytest.MonkeyPatch) -> date:
+    """Plant today fixed to Thursday 2026-10-15."""
+    monkeypatch.setattr(navigation, "_today", lambda: date(2026, 10, 15))
+    return date(2026, 10, 15)
 
 
 def ctx(permissions: list[str] | None = None, invocation_id: str | None = None, token: str = TOKEN, **ui: Any) -> SimpleNamespace:
@@ -97,7 +108,7 @@ async def test_invalid_arguments_come_back_as_errors(fake_backend):
         ({"page": "ai-insights", "tab": "faults", "item_id": "abc"}, "item_id must be a whole number"),
         ({"page": "ai-insights", "tab": "faults", "item_id": -3}, "item_id must be a positive id"),
         ({"page": "simulation", "section": "results"}, "Unknown section 'results'. Use one of: new, new-plan."),
-        ({"page": "asset-overview", "asset": "CH_01", "section": "alarms"}, "Unknown section 'alarms'"),
+        ({"page": "asset-overview", "asset": "CH_01", "section": "history"}, "Unknown section 'history'"),
     ]
     for kwargs, expected in cases:
         out = await open_(**kwargs)
@@ -125,9 +136,13 @@ async def test_other_pages_keep_only_their_fields(fake_backend):
     job = await open_(page="simulation", item_id=85, section="new")
     assert job["navigation"]["section"] is None and "section" in job["note"]
 
+    # the top-level parameter narrows the detail page's parameter list (the page searches names)
     unit = await open_(page="asset-overview", asset="ct-1", section="SPC", parameter="chwst")
-    assert unit["navigation"] == target(page="asset-overview", label="CT-01 equipment details (SPC)", asset="CT_01", asset_id=4, section="spc")
-    assert not fake_backend.calls_to("digital_twin/getassetparameters")  # parameter does not apply: not resolved
+    assert unit["navigation"] == target(
+        page="asset-overview", label="CT-01 equipment details (SPC) · search 'CHW Leaving Temp'", asset="CT_01", asset_id=4, section="spc",
+        filters={"parameter-search": ["CHW Leaving Temp"]},
+    )  # fmt: skip
+    assert "Ignored" not in unit["note"] and len(fake_backend.calls_to("digital_twin/getassetparameters")) == 1
     listing = await open_(page="asset-overview", section="status")
     assert listing["navigation"] == target(page="asset-overview", label="Equipment overview") and "section" in listing["note"]
     report = await open_(page="alarm-report", asset="CH_01", view="walk")
@@ -280,8 +295,293 @@ async def test_the_models_label_is_used_only_when_every_field_was_used(fake_back
     assert (await open_(page="digital-twin", asset="CT_01", label="Cooling tower 1"))["navigation"]["label"] == "Cooling tower 1"
 
 
+# URL keys each page reads (the assistant UI appends exactly these; contract B.10).
+PAGE_URL_KEYS = {
+    "production": ["tab", "window", "lot-status", "lot-search", "lot", "char", "quality-window", "quality-tool", "timeline-window"],
+    "plant-overview": ["location", "period"],
+    "ai-insights": ["status", "asset", "rule", "hours", "display", "detector", "q", "type", "unit"],
+    "simulation": ["status", "origin", "domain"],
+    "asset-overview": ["recent", "date", "parameter-search"],
+    "maintenance-order": ["view", "maintenanceStatusIds", "severityIds", "priorityIds", "maintenanceTypeIds", "assetIds", "no-locationIds-filter", "start", "end", "search"],
+    "alarm-report": ["eventview", "alarmTypeIds", "assetIds", "no-locationIds-filter", "start", "end", "search"],
+    "early-warning-and-diagnostics": ["severityIds", "assetIds", "no-locationIds-filter", "start", "end", "search"],
+}
+
+
+async def test_maintenance_order_filters_become_its_url_params(fake_backend, today):
+    out = await open_(
+        page="maintenance-order",
+        filters={"status": ["open", "In Progress"], "Severity": "critical", "assets": ["ch-1", "CT_01"], "start": "2026-10-08", "end": "2026-10-15", "search": " pump "},
+    )
+    nav = out["navigation"]
+    assert nav["filters"] == {
+        "maintenanceStatusIds": ["3", "4"], "severityIds": ["1"], "assetIds": ["1", "4"], "no-locationIds-filter": ["true"],
+        "start": ["2026-10-08"], "end": ["2026-10-15"], "search": ["pump"],
+    }  # fmt: skip
+    # 103 characters of filter text: cut at LABEL_MAX
+    assert len(nav["label"]) == navigation.LABEL_MAX and nav["label"].endswith("…")
+    assert nav["label"].startswith("Maintenance orders · open, in progress, critical, CH-01, CT-01, 2026-10-08 to")
+    assert "Ignored" not in out["note"] and "today's orders" not in out["note"]
+    assert fake_backend.calls_to("digital_twin/getassets")[0]["token"] == TOKEN
+
+    week = await open_(page="maintenance-order", filters={"status": ["outstanding"], "severity": ["critical"], "equipment": ["CH_01"], "start": "this-week"})
+    assert week["navigation"]["filters"] == {
+        "maintenanceStatusIds": ["1", "3", "4"], "severityIds": ["1"], "assetIds": ["1"], "no-locationIds-filter": ["true"],
+        "start": ["2026-10-12"], "end": ["2026-10-18"],  # the order list needs the rest of the week too
+    }  # fmt: skip
+    assert week["navigation"]["label"] == "Maintenance orders · outstanding, critical, CH-01, this week"
+
+    async def status_ids(status: Any) -> list[str] | None:
+        return (await open_(page="maintenance-order", filters={"status": status, "start": "today"}))["navigation"]["filters"].get("maintenanceStatusIds")
+
+    assert await status_ids("pending") == ["1", "3", "4"]  # an alias of outstanding
+    assert await status_ids("paused") == ["7"]
+    assert await status_ids("open, done") == ["3", "5"]  # a comma-separated list
+    assert await status_ids(["requested", "rejected", "open", "in-progress", "paused", "done", "closed"]) is None  # all: the page's "All"
+    merged = await open_(page="maintenance-order", filters={"status": "open", "statuses": ["done"], "severity": ["critical", "high", "medium", "low"], "start": "today"})
+    assert merged["navigation"]["filters"] == {"maintenanceStatusIds": ["3", "5"], "start": ["2026-10-15"], "end": ["2026-10-15"]}
+    period = await open_(page="maintenance-order", section="calendar", filters={"period": "this week", "type": "PM", "priority": "high"})
+    assert period["navigation"]["filters"] == {"view": ["calendar"], "priorityIds": ["1"], "maintenanceTypeIds": ["2"], "start": ["2026-10-12"], "end": ["2026-10-18"]}
+    assert period["navigation"]["label"] == "Maintenance orders: calendar · high, preventive, this week"
+    assert (await open_(page="maintenance-order", filters={"equipment": [4.0], "start": "today"}))["navigation"]["filters"]["assetIds"] == ["4"]
+    today_only = await open_(page="maintenance-order", filters={"severity": "high"})
+    assert "Without a period the page lists only today's orders; say so." in today_only["note"]
+    assert (await open_(page="maintenance-order", section="table"))["navigation"]["filters"] == {"view": ["list"]}
+
+
+@pytest.mark.parametrize(
+    ("given", "start", "end"),
+    [
+        ({"start": "today"}, "2026-10-15", "2026-10-15"),
+        ({"start": "yesterday"}, "2026-10-14", "2026-10-14"),
+        ({"start": "this-week"}, "2026-10-12", "2026-10-15"),
+        ({"start": "last 7 days"}, "2026-10-09", "2026-10-15"),
+        ({"start": "last-30-days"}, "2026-09-16", "2026-10-15"),
+        ({"end": "this-week"}, "2026-10-12", "2026-10-15"),
+        ({"start": "2026-10-01"}, "2026-10-01", "2026-10-15"),
+        ({"start": "2026-10-20"}, "2026-10-20", "2026-10-20"),
+        ({"end": "2026-10-03"}, "2026-10-03", "2026-10-03"),
+        ({"date": "yesterday"}, "2026-10-14", "2026-10-14"),
+        ({"day": "2026-10-01"}, "2026-10-01", "2026-10-01"),  # an ISO date under date / day / period / window is that day
+        ({"date": "2026-10-01", "end": "2026-10-03"}, "2026-10-01", "2026-10-03"),
+        ({"from": "today", "to": "today"}, "2026-10-15", "2026-10-15"),
+    ],
+)
+async def test_relative_and_open_ended_periods(fake_backend, today, given, start, end):
+    out = await open_(page="alarm-report", filters=given)
+    assert out["navigation"]["filters"] == {"start": [start], "end": [end]}
+
+
+async def test_invalid_filters_come_back_as_errors(fake_backend, today):
+    cases = [
+        ({"page": "maintenance-order", "filters": {"status": "stuck"}}, "Unknown status filter 'stuck'. Use one of: requested, rejected, open,"),
+        ({"page": "maintenance-order", "filters": {"severity": ["high", "urgent"]}}, "Unknown severity filter 'urgent'"),
+        ({"page": "maintenance-order", "filters": {"severity": True}}, "severity must be a value or a list of values."),
+        ({"page": "maintenance-order", "filters": {"severity": [{"x": 1}]}}, "severity must be a value or a list of values."),
+        ({"page": "alarm-report", "filters": {"start": "10/08/2026"}}, "start must be a date like 2026-10-08 or one of today, yesterday, this-week"),
+        ({"page": "alarm-report", "filters": {"start": "2026-10-10", "end": "2026-10-01"}}, "start (2026-10-10) is after end (2026-10-01)."),
+        ({"page": "alarm-report", "filters": {"start": "2025-09-01", "end": "2026-10-05"}}, "The period is longer than 366 days"),
+        ({"page": "alarm-report", "filters": {"start": "today", "end": "2026-10-01"}}, "Use a relative period (e.g. last-7-days) alone, without another date."),
+        ({"page": "alarm-report", "filters": {"start": ["2026-10-01", "2026-10-02"]}}, "start takes one value (got 2026-10-01, 2026-10-02)."),
+        ({"page": "maintenance-order", "filters": "status=open"}, 'filters must be an object of filter names and values, e.g. {"status": ["open"]}.'),
+        ({"page": "maintenance-order", "filters": []}, "filters must be an object of filter names and values"),
+        ({"page": "ai-insights", "filters": {"status": "cleared"}}, "AI Insights filters need their tab"),
+        ({"page": "ai-insights", "tab": "faults", "filters": {"equipment": ["CH_01", "CT_01"]}}, "equipment takes one value (got CH_01, CT_01)."),
+        ({"page": "ai-insights", "tab": "faults", "filters": {"rule": "11"}}, "rule must be a fault rule code like CHL-011 (got '11')."),
+        ({"page": "production", "filters": {"window": "fortnight"}}, "Unknown window filter 'fortnight'. Use one of: 12, 24, 168, 720."),
+        ({"page": "production", "filters": {"lot": "M26 01"}}, "lot must be a code like the ones the production tools return (got 'M26 01')."),
+        ({"page": "asset-overview", "asset": "CT_01", "filters": {"date": "last-7-days"}}, "date is one day: use a date like 2026-10-08, today or yesterday"),
+        ({"page": "asset-overview", "asset": "CT_01", "filters": {"parameter": "fan_speed"}}, "CT_01 has no parameter 'fan_speed'"),
+        ({"page": "asset-overview", "asset": "CT_01", "filters": {"parameter": "chwst", "search": "fan"}}, "parameter_search takes one value (got chwst, fan)."),
+        ({"page": "maintenance-order", "filters": {"equipment": "ZZ_99"}}, "No visible equipment matches 'ZZ_99'"),
+        ({"page": "plant-overview", "filters": {"location": "Basement"}}, "Unknown location 'Basement'"),
+    ]
+    for kwargs, expected in cases:
+        out = await open_(**kwargs)
+        assert set(out) == {"error"} and expected in out["error"], (kwargs, out)
+    fake_backend.handlers["digital_twin/getassets"] = lambda body, tok: [] if tok == FAB1_TOKEN else ASSETS
+    try:
+        hidden = await open_(ctx(token=FAB1_TOKEN), page="maintenance-order", filters={"equipment": ["CH_01"]})
+        assert "No visible equipment matches 'CH_01'" in hidden["error"]
+    finally:
+        fake_backend._install_defaults()
+    room = await open_(ctx(token=FAB1_TOKEN), page="plant-overview", filters={"location": "Chiller Plant Room"})
+    assert "Chiller Plant Room is outside the user's location access" in room["error"]
+
+
+async def test_users_without_twin_access_resolve_equipment_by_name(fake_backend, today):
+    """Without digitaltwin.read the equipment comes from the filter tree: names, no aliases."""
+
+    def denied(body: dict[str, Any], tok: str) -> Any:
+        raise FakeError(403, "Permission denied")
+
+    tree = fake_backend.handlers["filter/getalllocationsandassets"]
+    fake_backend.handlers["digital_twin/getassets"] = denied
+    seed = {1: "Chiller CH-01", 5: "CW Pump CWP-01", 41: "Process Chiller PCH-01", 42: "PCW Pump PCWP-01"}  # the seed's names
+    units = [{"id": i, "name": name} for i, name in seed.items()]
+    fake_backend.handlers["filter/getalllocationsandassets"] = lambda body, tok: [{"id": 16, "parent_id": None, "name": "Chiller Plant Room", "assets": units}]
+    maintenance_only = ctx([p for p in PERMS if p != "digitaltwin.read"])
+    try:
+        orders = await open_(maintenance_only, page="maintenance-order", filters={"equipment": ["CH_01", "cwp-1", "CH-01", "PCWP_01"], "start": "today"})
+        assert orders["navigation"]["filters"]["assetIds"] == ["1", "5", "42"]  # by the tag in the name, not inside PCH-01 / PCWP-01
+        docs = await open_(maintenance_only, page="ai-insights", tab="documents", filters={"equipment": "CH_01"})
+        assert docs["navigation"]["filters"] is None and "Ignored (not used by ai-insights): filters.equipment." in docs["note"]
+        unit = await open_(maintenance_only, page="asset-overview", asset="1", filters={"parameter": "fan_speed"})
+        assert unit["navigation"]["filters"] == {"parameter-search": ["fan speed"]}  # its parameters cannot be read: as text
+        assert not fake_backend.calls_to("digital_twin/getassetparameters")
+    finally:
+        fake_backend._install_defaults()
+        fake_backend.handlers["filter/getalllocationsandassets"] = tree
+
+
+async def test_filters_that_do_not_apply_are_ignored(fake_backend, today):
+    twin = await open_(page="digital-twin", asset="CT_01", filters={"status": "open"})
+    assert twin["navigation"]["filters"] is None and "Ignored (not used by digital-twin): filters.status." in twin["note"]
+    walk = await open_(page="digital-twin", asset="CT_01", filters={"walk": True, "empty": ""})  # ignored filters are not validated
+    assert walk["navigation"]["asset"] == "CT_01" and "Ignored (not used by digital-twin): filters.walk." in walk["note"]
+    rules = await open_(page="ai-insights", tab="rules", filters={"status": {"x": 1}})
+    assert rules["navigation"]["filters"] is None and "filters.status" in rules["note"]
+    colour = await open_(page="maintenance-order", label="Red orders", filters={"colour": "red", "start": "today"})
+    assert colour["navigation"]["label"] == "Maintenance orders · today" and "Ignored (not used by maintenance-order): filters.colour." in colour["note"]
+    quality = await open_(page="production", section="quality", filters={"lot_status": "hold"})
+    assert quality["navigation"]["filters"] is None and "filters.lot_status" in quality["note"]
+    kpi = await open_(page="production", section="kpi", filters={"quality_window": "30d", "window": "24h"})
+    assert kpi["navigation"]["filters"] == {"window": ["24"]} and "filters.quality_window" in kpi["note"]
+    detector = await open_(page="ai-insights", tab="faults", filters={"detector": "zscore"})
+    assert detector["navigation"]["filters"] is None and "filters.detector" in detector["note"]
+    active = await open_(page="ai-insights", tab="faults", filters={"status": "active", "window": "7d"})
+    assert active["navigation"]["filters"] == {"status": ["ACTIVE"]} and "filters.window" in active["note"]
+    listing = await open_(page="asset-overview", filters={"date": "today"})
+    assert listing["navigation"]["filters"] is None and "filters.date" in listing["note"]
+    chiller = await open_(page="simulation", section="new-plan", filters={"workspace": "chiller"})
+    assert chiller["navigation"]["filters"] is None and "filters.workspace" in chiller["note"]
+    fab = await open_(page="simulation", section="new-plan", filters={"workspace": "fab"})
+    assert fab["navigation"]["filters"] is None and "Ignored" not in fab["note"]
+
+
+async def test_production_sections_and_filters(fake_backend):
+    hold = (await open_(page="production", filters={"lot_status": "on hold"}))["navigation"]
+    assert (hold["section"], hold["filters"], hold["label"]) == ("lots", {"lot-status": ["hold"]}, "Production: lots · hold")
+    assert (await open_(page="production", section="lots"))["navigation"]["filters"] is None  # the UI sets a tab id's tab itself
+    scrap = (await open_(page="production", section="scrap pareto"))["navigation"]
+    assert (scrap["section"], scrap["filters"], scrap["label"]) == ("scrap", {"tab": ["quality"]}, "Production: scrap")
+    kpi = (await open_(page="production", section="kpi"))["navigation"]
+    assert (kpi["section"], kpi["filters"]) == ("kpi", None)
+    assert (await open_(page="production", section="oee"))["navigation"]["section"] == "oee"  # the KPI card, no longer the overview tab
+    assert (await open_(page="production", filters={"window": "week"}))["navigation"]["filters"] == {"window": ["168"]}
+    assert (await open_(page="production", filters={"window": 168.0}))["navigation"]["filters"] == {"window": ["168"]}
+    assert (await open_(page="production", filters={"window": ["7d", "week"]}))["navigation"]["filters"] == {"window": ["168"]}  # one value
+    tool = (await open_(page="production", filters={"quality_tool": "CT_01"}))["navigation"]
+    assert (tool["section"], tool["filters"]) == ("quality", {"quality-tool": ["4"]})
+    lot = await open_(page="production", filters={"lot": "m261013.01", "char": "padox.thk"})
+    assert (lot["navigation"]["section"], lot["navigation"]["filters"]) == ("lots", {"lot": ["M261013.01"]})
+    assert "Ignored (not used by production): filters.characteristic." in lot["note"]
+    chart = (await open_(page="production", section="spc chart", filters={"char_key": "padox.thk", "quality_window": "month"}))["navigation"]
+    assert chart["filters"] == {"tab": ["quality"], "char": ["PADOX.THK"], "quality-window": ["720"]}
+    assert chart["label"] == "Production: characteristic · PADOX.THK, last 30 days"
+
+
+async def test_ai_insights_filters_belong_to_the_tab(fake_backend):
+    faults = (await open_(page="ai-insights", tab="faults", filters={"status": "cleared", "equipment": "CT_01", "window": "30d", "display": "timeline"}))["navigation"]
+    assert faults["filters"] == {"status": ["CLEARED"], "asset": ["4"], "hours": ["720"], "display": ["timeline"]}
+    assert faults["label"] == "AI Insights: Faults · cleared, CT-01, last 30 days, timeline"
+    # the page ignores the window while it shows the active faults: a window alone shows all of them
+    assert (await open_(page="ai-insights", tab="faults", filters={"window": "7d"}))["navigation"]["filters"] == {"status": ["all"], "hours": ["168"]}
+    anomalies = await open_(page="ai-insights", tab="anomaly", filters={"detector": "z-score", "units": "CH_02", "window": "day"})
+    assert anomalies["navigation"]["filters"] == {"status": ["all"], "detector": ["zscore"], "asset": ["2"], "hours": ["24"]}
+    docs = await open_(page="ai-insights", tab="documents", filters={"type": "report", "equipment": "ch-1", "status": "indexed"})
+    assert docs["navigation"]["filters"] == {"type": ["maintenance_report"], "status": ["READY"], "unit": ["CH_01"]}
+    long = await open_(page="ai-insights", tab="documents", filters={"search": "x" * 100})
+    assert long["navigation"]["filters"] == {"q": ["x" * 60]}  # cut without an ellipsis
+    cleared = await open_(page="ai-insights", tab="faults", filters={"status": "Cleared", "statuses": "cleared"})  # one value, two spellings
+    assert cleared["navigation"]["filters"] == {"status": ["CLEARED"]}
+    recs = await open_(page="ai-insights", tab="recommendations", filters={"status": "validated"})
+    assert recs["navigation"]["filters"] == {"status": ["VALIDATED"]}
+    assert (await open_(page="ai-insights", tab="recommendations", filters={"status": "all"}))["navigation"]["filters"] is None
+
+
+async def test_simulation_and_plant_overview_filters(fake_backend):
+    assert (await open_(page="simulation", section="new-plan"))["navigation"]["filters"] is None  # the UI opens the fab workspace
+    jobs = await open_(page="simulation", filters={"status": "needs approval", "origin": "assistant"})
+    assert jobs["navigation"]["filters"] == {"status": ["approval"], "origin": ["agent"]}
+    assert jobs["navigation"]["label"] == "Simulation jobs · approval, agent"
+    assert (await open_(page="simulation", filters={"status": "all", "workspace": "wafer fab"}))["navigation"]["filters"] == {"domain": ["fab"]}
+
+    plant = await open_(page="plant-overview", filters={"location": "chiller plant room", "period": "30d"})
+    assert plant["navigation"]["filters"] == {"location": ["16"], "period": ["30"]}  # the fixture's ids are index + 1
+    assert plant["navigation"]["label"] == "Plant overview · Chiller Plant Room, last 30 days"
+    top = await open_(page="plant-overview", location="Chiller Plant Room")  # where the model predictably puts it
+    assert top["navigation"]["filters"] == {"location": ["16"]} and top["navigation"]["location"] is None and "Ignored" not in top["note"]
+    both = await open_(page="plant-overview", location="CUB Roof", section="tiles", filters={"location": "Chiller Plant Room", "period": "today"})
+    assert both["navigation"]["filters"] == {"location": ["16"], "period": ["1"]} and "Ignored (not used by plant-overview): location." in both["note"]
+    assert both["navigation"]["label"] == "Plant overview: summary · Chiller Plant Room, today"
+    assert "needs the permission locationoverview.read" in (await open_(ctx(["aiassistant.read"]), page="plant-overview"))["error"]
+    assert len(fake_backend.calls_to("filter/getalllocationsandassets")) == 1  # the location rows are cached per user
+
+    # a leaf location has no cards of its own: the page shows its parent's
+    rows = [{"id": i + 1, "parent_id": 15 if name == "Chiller Plant Room" else None, "name": name, "assets": []} for i, name in enumerate(navigation.LOCATIONS)]
+    fake_backend.handlers["filter/getalllocationsandassets"] = lambda body, tok: rows
+    backend_api.clear_cache()
+    leaf = (await open_(page="plant-overview", filters={"location": "Chiller Plant Room"}))["navigation"]
+    assert (leaf["filters"], leaf["section"], leaf["label"]) == ({"location": ["15"]}, "locations", "Plant overview: locations · Chiller Plant Room")
+
+
+async def test_alarm_report_early_warning_and_asset_filters(fake_backend, today):
+    events = (await open_(page="alarm-report", section="events", filters={"alarm_type": "abnormal", "equipment": "CT_01", "start": "yesterday"}))["navigation"]
+    assert events["filters"] == {
+        "eventview": ["true"], "alarmTypeIds": ["ABNORMAL"], "assetIds": ["4"], "no-locationIds-filter": ["true"], "start": ["2026-10-14"], "end": ["2026-10-14"],
+    }  # fmt: skip
+    assert events["label"] == "Alarm report: events · abnormal, CT-01, yesterday"
+    for both in (["alarm", "abnormal"], "both", ["alarm", "both"]):  # the page shows one type: both is its "all"
+        out = (await open_(page="alarm-report", section="report", filters={"alarm_type": both}))["navigation"]
+        assert out["filters"] == {"eventview": ["false"]} and out["label"] == "Alarm report: report · alarm, abnormal"
+
+    warnings = await open_(page="early-warning-and-diagnostics", filters={"severity": ["high"]})
+    assert warnings["navigation"]["filters"] == {"severityIds": ["2"]}
+    assert "Without a period the page lists only today's warnings; say so." in warnings["note"]
+    assert (await open_(page="early-warning-and-diagnostics", section="diagnosis"))["navigation"]["section"] == "diagnostics"
+    assert "Unknown section 'degradation'" in (await open_(page="early-warning-and-diagnostics", section="degradation"))["error"]
+
+    alarms = (await open_(page="asset-overview", asset="CT_01", section="alarms", filters={"date": "yesterday", "parameter_search": "fan"}))["navigation"]
+    assert alarms["filters"] == {"recent": ["alarm"], "date": ["2026-10-14"], "parameter-search": ["fan"]}
+    assert alarms["label"] == "CT-01 equipment details (recent alarms) · yesterday, search 'fan'"
+    power = await open_(page="asset-overview", asset="CT_01", filters={"parameter": "power_kw"})
+    assert power["navigation"]["filters"] == {"parameter-search": ["Power"]}  # the page searches names, not aliases
+    orders = (await open_(page="asset-overview", asset="CT_01", section="recent maintenance"))["navigation"]
+    assert (orders["section"], orders["filters"]) == ("maintenance", {"recent": ["maintenance"]})
+    named = await open_(page="asset-overview", asset="CT_01", parameter="chwst", filters={"search": "pow"})
+    assert named["navigation"]["filters"] == {"parameter-search": ["pow"]} and "Ignored (not used by asset-overview): parameter." in named["note"]
+
+
+async def test_every_emitted_url_key_is_one_the_page_reads(fake_backend, today):
+    samples = [
+        ("production", {"section": "scrap", "filters": {"window": "24h", "quality_window": "30d", "char": "DEFECTS", "tool": "CT_01"}}),
+        ("production", {"filters": {"lot_status": "hold", "lot_search": "M26", "lot": "M261013.01"}}),
+        ("production", {"section": "timeline", "filters": {"timeline_window": "3d"}}),
+        ("plant-overview", {"filters": {"location": "CUB Roof", "period": "7d"}}),
+        ("ai-insights", {"tab": "faults", "filters": {"status": "cleared", "equipment": "CT_01", "rule": "chl-011", "window": "90d", "display": "table"}}),
+        ("ai-insights", {"tab": "anomalies", "filters": {"detector": "ewma", "window": "24h"}}),
+        ("ai-insights", {"tab": "recommendations", "filters": {"status": "validated"}}),
+        ("ai-insights", {"tab": "documents", "filters": {"q": "pump", "type": "sop", "status": "ready", "unit": "CH_01"}}),
+        ("simulation", {"filters": {"status": "failed", "origin": "ui", "workspace": "fab"}}),
+        ("asset-overview", {"asset": "CT_01", "section": "maintenance", "filters": {"date": "2026-10-14", "search": "power"}}),
+        ("maintenance-order", {"section": "list", "filters": {"status": "open", "severity": "low", "priority": "high", "type": "pm", "equipment": "CT_01", "start": "last-7-days", "search": "pump"}}),
+        ("alarm-report", {"section": "report", "filters": {"type": "alarm", "equipment": "CT_01", "start": "today", "search": "trip"}}),
+        ("early-warning-and-diagnostics", {"filters": {"severity": "critical", "equipment": "CT_01", "from": "2026-10-01", "to": "2026-10-14", "search": "pump"}}),
+    ]
+    emitted: dict[str, set[str]] = {}
+    for page, kwargs in samples:
+        nav = (await open_(page=page, **kwargs))["navigation"]
+        assert nav["filters"] and set(nav["filters"]) <= set(PAGE_URL_KEYS[page]), (page, nav["filters"])
+        assert all(isinstance(v, str) for values in nav["filters"].values() for v in values)
+        emitted.setdefault(page, set()).update(nav["filters"])
+    assert {page: sorted(keys) for page, keys in emitted.items()} == {page: sorted(keys) for page, keys in PAGE_URL_KEYS.items()}
+
+
 def test_navigate_event_summary_history_and_context_line():
-    nav = target(page="digital-twin", label="CT-01 in the digital twin", asset="CT_01", asset_id=4)
+    assert navigation.NAV_KEYS[-1] == "filters"
+    # the stream copies every key of the target, filters included, whatever the page
+    nav = target(page="digital-twin", label="CT-01 in the digital twin", asset="CT_01", asset_id=4, filters={"severityIds": ["1"]})
     payload = {"navigation": {**nav, "extra": "dropped"}, "status": "opened", "note": "n"}
     assert stream.result_items("open_in_app", payload, True) == [("navigate", nav)]
     assert stream.result_items("open_in_app", {"error": "Unknown page"}, False) == []
@@ -339,7 +639,11 @@ async def test_root_handles_navigation_itself_and_every_chat_agent_has_the_tool(
     for agent in (ROOT, INSIGHT, TWIN):
         req = models[agent].requests[0]
         assert "open_in_app" in req.tools_dict, agent
+        assert "filters" in req.tools_dict["open_in_app"]._get_declaration().parameters_json_schema["properties"], agent
         assert prompts.NAVIGATION in str(req.config.system_instruction), agent
+        # every chat agent is LEVO and declines off-topic requests itself
+        assert prompts.IDENTITY in str(req.config.system_instruction), agent
+        assert prompts.SCOPE in str(req.config.system_instruction), agent
 
 
 async def test_a_second_navigation_in_one_answer_is_refused(cleanup_usage):
