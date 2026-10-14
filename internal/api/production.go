@@ -1268,7 +1268,7 @@ func (s *Server) prodQualityKeys(c *Ctx) (any, error) {
 			(SELECT min(rs.spec_name) FROM prod.route_steps rs WHERE rs.meas_key = m.char_key OR (m.char_key IS NULL AND rs.param = 'defects')),
 			(SELECT string_agg(DISTINCT rs.step_code, ', ') FROM prod.route_steps rs WHERE rs.meas_key = m.char_key),
 			(SELECT min(rs.seq) FROM prod.route_steps rs WHERE rs.meas_key = m.char_key OR (m.char_key IS NULL AND rs.param = 'defects'))
-		FROM prod.metrology m WHERE m.measured_at >= $1 AND m.measured_at < $2 GROUP BY 1 ORDER BY 13, 1`, from, to)
+		FROM prod.metrology m WHERE m.measured_at >= $1 AND m.measured_at < $2 GROUP BY m.char_key ORDER BY 13, 1`, from, to)
 	if err != nil {
 		return nil, err
 	}
