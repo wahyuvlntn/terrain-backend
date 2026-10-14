@@ -54,7 +54,11 @@ async def close_client() -> None:
 
 
 class BackendClient:
-    """Calls `/api/js-service/exposed/execute/{org}/{project}/{script}` as one user."""
+    """Calls `/api/js-service/exposed/execute/{org}/{project}/{script}` as one user.
+
+    `origin` is sent as X-AFDD-Origin ("agent": the AI assistant acts); an empty origin sends none,
+    for a request the person made themselves through the assistant (a form they submitted).
+    """
 
     def __init__(self, session_token: str, *, origin: str = "agent", timeout: float = 30.0):
         if not session_token:
@@ -71,7 +75,7 @@ class BackendClient:
             resp = await _http().post(
                 path,
                 json=data or {},
-                headers={SESSION_HEADER: self._token, ORIGIN_HEADER: self._origin},
+                headers={SESSION_HEADER: self._token, **({ORIGIN_HEADER: self._origin} if self._origin else {})},
                 timeout=self._timeout,
             )
         except httpx.HTTPError as err:
