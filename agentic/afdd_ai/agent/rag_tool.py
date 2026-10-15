@@ -6,10 +6,12 @@ location scope. The tool returns results with a `ref` number; the agent cites
 them as [ref] and the SSE layer turns the same results into a `citations` event
 (ref, document id, title, type, page, snippet, score) for the PDF viewer.
 
-Refs are numbered per answer (one ADK invocation), across every search and
-relayed fault instruction in it: a later search continues the numbering and a
-passage cited before keeps its number, so the markers in the text always match
-the source chips. They live in `temp:` state, which ADK drops after the turn.
+Refs are numbered per answer (one ADK invocation) and per document page, across
+every search and relayed fault instruction in it: passages on one page share a
+number (and a source chip: the PDF viewer opens pages), a later search continues
+the numbering and a page cited before keeps its number, so the markers in the
+text always match the source chips. They live in `temp:` state, which ADK drops
+after the turn.
 """
 
 from __future__ import annotations
@@ -38,10 +40,10 @@ REFS_KEY = "temp:citation_refs"
 
 
 def source_key(r: Mapping[str, Any]) -> str:
-    """Identity of a cited passage: its chunk, else document and page."""
-    if r.get("chunk_id") is not None:
-        return f"chunk:{r.get('chunk_id')}"
-    return f"doc:{r.get('document_id')}#{r.get('page') or ''}"
+    """Identity of a cited source: its document page (passages on one page share it), else its chunk."""
+    if r.get("document_id") is not None:
+        return f"doc:{r.get('document_id')}#{r.get('page') or ''}"
+    return f"chunk:{r.get('chunk_id')}"
 
 
 def citation_ref(state: MutableMapping[str, Any], key: str) -> int:
@@ -99,7 +101,8 @@ def renumber_instruction(state: MutableMapping[str, Any], data: Any) -> Any:
             nums = _marker_numbers(m.group(1))
             if not nums or any(n not in mapping for n in nums):
                 return m.group(0)
-            return "[" + ", ".join(str(mapping[n]) for n in dict.fromkeys(nums)) + "]"
+            # sources on one page share a ref: [1, 2] of one page reads [3]
+            return "[" + ", ".join(str(r) for r in dict.fromkeys(mapping[n] for n in nums)) + "]"
 
         md = _MARKER.sub(repl, md)
     return {**data, "instruction_sources": rows, "instruction_md": md}
@@ -120,11 +123,16 @@ async def allowed_location_ids(api: Api) -> list[int] | None:
 
 
 def citation_items(results: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """`citations` SSE items from search results."""
+    """`citations` SSE items from search results, one per ref (the first passage of a page)."""
     items = []
+    refs = set()
     for r in results:
         if not isinstance(r, Mapping) or r.get("document_id") is None:
             continue
+        if r.get("ref") is not None:
+            if r["ref"] in refs:
+                continue
+            refs.add(r["ref"])
         content = str(r.get("content") or "")
         items.append(
             {
