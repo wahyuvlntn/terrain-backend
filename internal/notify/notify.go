@@ -93,7 +93,10 @@ func (s *Service) push(ctx context.Context, id int64, n Notification) {
 		return
 	}
 	var parentID *int64
-	var locationName *string
+	var locationName, assetAlias *string
+	if n.AssetID != nil {
+		_ = s.db.QueryRow(ctx, `SELECT alias FROM asset.equipment WHERE id = $1`, *n.AssetID).Scan(&assetAlias)
+	}
 	ancestors := []any{}
 	if n.LocationID != nil {
 		_ = s.db.QueryRow(ctx, `SELECT parent_id, name FROM asset.locations WHERE id = $1`, *n.LocationID).Scan(&parentID, &locationName)
@@ -117,6 +120,7 @@ func (s *Service) push(ctx context.Context, id int64, n Notification) {
 		"message":        n.Message,
 		"messageHTML":    n.MessageHTML,
 		"assetId":        n.AssetID,
+		"assetAlias":     assetAlias,
 		"locationId":     n.LocationID,
 		"parentId":       parentID,
 		"locationName":   locationName,

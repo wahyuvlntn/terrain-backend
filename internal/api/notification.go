@@ -103,9 +103,10 @@ func (s *Server) notifList(c *Ctx) (any, error) {
 	}
 	args = append(args, limit+1, (page-1)*limit)
 	rows, err := s.DB.Query(c, fmt.Sprintf(`SELECT n.id, n.category, n.message, n.message_html, n.asset_id, n.location_id, l.parent_id, l.name,
-			n.created_at, n.additional_data, nr.notification_id IS NOT NULL, n.recipients
+			n.created_at, n.additional_data, nr.notification_id IS NOT NULL, n.recipients, e.alias
 		FROM core.notifications n
 		LEFT JOIN asset.locations l ON l.id = n.location_id
+		LEFT JOIN asset.equipment e ON e.id = n.asset_id
 		LEFT JOIN core.notification_reads nr ON nr.notification_id = n.id AND nr.user_id = $1
 		WHERE %s ORDER BY n.created_at DESC, n.id DESC LIMIT $%d OFFSET $%d`, strings.Join(where, " AND "), len(args)-1, len(args)), args...)
 	if err != nil {
@@ -120,13 +121,13 @@ func (s *Server) notifList(c *Ctx) (any, error) {
 	for rows.Next() {
 		var id int64
 		var category, message string
-		var html, locName *string
+		var html, locName, assetAlias *string
 		var assetID, locID, parentID *int64
 		var at time.Time
 		var additional []byte
 		var isRead bool
 		var recipients []string
-		if err := rows.Scan(&id, &category, &message, &html, &assetID, &locID, &parentID, &locName, &at, &additional, &isRead, &recipients); err != nil {
+		if err := rows.Scan(&id, &category, &message, &html, &assetID, &locID, &parentID, &locName, &at, &additional, &isRead, &recipients, &assetAlias); err != nil {
 			return nil, err
 		}
 		var add *string
@@ -135,7 +136,7 @@ func (s *Server) notifList(c *Ctx) (any, error) {
 			add = &str
 		}
 		items = append(items, item{locID: locID, m: map[string]any{
-			"id": id, "category": category, "message": message, "message_html": html, "asset_id": assetID,
+			"id": id, "category": category, "message": message, "message_html": html, "asset_id": assetID, "asset_alias": assetAlias,
 			"location_id": locID, "parent_id": parentID, "location_name": locName, "timestamp": httpx.TS(at),
 			"additional_data": add, "is_read": isRead, "recipients": emptyIfNil(recipients),
 		}})
