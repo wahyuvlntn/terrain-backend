@@ -924,6 +924,18 @@ func (s *Server) simListJobs(c *Ctx) (any, error) {
 		}
 		conds = append(conds, "j.origin = "+args.add(origin))
 	}
+	// kind: scenario / doe (chiller plant) or production (fab), comma separated
+	if list, ok := c.F.StringList("kind"); ok && len(list) > 0 {
+		kinds := []string{}
+		for _, k := range list {
+			k = strings.ToLower(strings.TrimSpace(k))
+			if k != "scenario" && k != "doe" && k != "production" {
+				return nil, httpx.BadRequestf("Unknown job kind %q", k)
+			}
+			kinds = append(kinds, k)
+		}
+		conds = append(conds, "j.kind = ANY("+args.add(kinds)+")")
+	}
 	vis, err := s.simVisibleClause(c, &args)
 	if err != nil {
 		return nil, err
