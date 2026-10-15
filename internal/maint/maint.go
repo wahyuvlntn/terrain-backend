@@ -361,7 +361,8 @@ func (s *Service) notifyOrder(ctx context.Context, o *Order, category, message s
 	}
 	if err := s.notify.Send(ctx, notify.Notification{
 		Category: category, Message: message, AssetID: &assetID, LocationID: &loc, Recipients: clean,
-		AdditionalData: map[string]any{"maintenance_id": o.ID, "order_name": o.Name, "selected": o.ID},
+		AdditionalData: map[string]any{"maintenance_id": o.ID, "order_name": o.Name, "selected": o.ID,
+			"planned_start": o.PlannedStart.UTC().Format(time.RFC3339)},
 	}); err != nil {
 		slog.Warn("maintenance notification", "err", err)
 	}
