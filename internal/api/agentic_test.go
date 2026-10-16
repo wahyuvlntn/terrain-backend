@@ -583,6 +583,15 @@ func TestOptimizerPeriod(t *testing.T) {
 	}
 }
 
+func TestDailyBudgetUSD(t *testing.T) {
+	for env, want := range map[string]float64{"": recDefaultBudgetUSD, "0": 0, "2.5": 2.5, "-1": 0, "x": recDefaultBudgetUSD} {
+		t.Setenv("AI_DAILY_BUDGET_USD", env)
+		if got := dailyBudgetUSD(); got != want {
+			t.Errorf("AI_DAILY_BUDGET_USD=%q: %v, want %v", env, got, want)
+		}
+	}
+}
+
 func TestDocHelpers(t *testing.T) {
 	for in, want := range map[string]string{
 		`C:\Users\me\Chiller Manual.PDF`: "Chiller Manual.PDF",
@@ -703,7 +712,7 @@ func TestAgentProxyRefusals(t *testing.T) {
 	}
 	// Agent unreachable: 503 JSON envelope.
 	code, body := call(s, admin)
-	if code != http.StatusServiceUnavailable || body["error"] != "The AI assistant is not available right now" {
+	if code != http.StatusServiceUnavailable || body["error"] != "LEVO is not available right now" {
 		t.Errorf("unreachable agent: %d %v", code, body)
 	}
 	// The agent rejecting the proxy's credentials becomes 502, never a 401
@@ -715,7 +724,7 @@ func TestAgentProxyRefusals(t *testing.T) {
 	}))
 	defer upstream.Close()
 	code, body = call(&Server{cfg: &config.Config{AgentURL: upstream.URL, AgentSecret: "wrong"}}, admin)
-	if code != http.StatusBadGateway || body["error"] != "The AI assistant is not configured correctly" {
+	if code != http.StatusBadGateway || body["error"] != "LEVO is not configured correctly" {
 		t.Errorf("agent 401: %d %v", code, body)
 	}
 	// Not configured (no URL / no secret).

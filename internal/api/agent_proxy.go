@@ -177,7 +177,7 @@ func newAgentProxy(target *url.URL, secret string, id agentIdentity, idToken str
 				// the browser treat it as an expired session and sign the user out.
 				slog.Warn("AI assistant rejected the proxy credentials (check AGENT_SHARED_SECRET)", "path", resp.Request.URL.Path)
 				resp.Body.Close()
-				const msg = "The AI assistant is not configured correctly"
+				const msg = "LEVO is not configured correctly"
 				body, _ := json.Marshal(map[string]any{"data": nil, "error": msg, "message": msg})
 				resp.StatusCode = http.StatusBadGateway
 				resp.Status = "502 Bad Gateway"
@@ -245,6 +245,6 @@ func headerSafe(v string) string {
 // writeAgentUnavailable answers 503 in the error envelope of the API (logged
 // by the caller where useful, not per request).
 func writeAgentUnavailable(w http.ResponseWriter) {
-	const msg = "The AI assistant is not available right now"
+	const msg = "LEVO is not available right now"
 	httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"data": nil, "error": msg, "message": msg})
 }
