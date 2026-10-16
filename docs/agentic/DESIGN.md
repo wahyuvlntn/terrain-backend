@@ -453,7 +453,8 @@ Asyncio service, one process. Tasks:
 Anomaly detection (production data, `ts.parameter_values`, 1-min): in-memory rolling buffers per
 equipment parameter (24 h warm-up from DB, then incremental). Numeric, displayed, non-writable,
 non-status params of RUNNING units only. Detectors (config in `analytics/anomaly.py`):
-* `range`: outside physical span per unit (°C −10..80, %, kPa ≥ 0 …) → CRITICAL;
+* `range`: outside physical span per unit (°C −10..80, %, kPa ≥ 0 …), or per parameter and unit where
+  the physics leaves it (furnace tube, scrubber burner and inlet suction, dry pump body …) → CRITICAL;
 * `flatline`: max − min < resolution for ≥ 30 min while running → WARNING;
 * `zscore`: robust modified z (median / MAD over 60 min, excluding the current point), |M| > 3.5 for 3
   consecutive points → WARNING (|M| > 6 CRITICAL);
@@ -542,17 +543,23 @@ Chart tools (`agent/charts.py`): `chart_parameter_trend(asset, params[], hours)`
 ECharts option (no functions / HTML), cap 2,000 points per series; responses carry `{"chart": {"id",
 "title", "option"}}`.
 
-Navigation tool (`agent/navigation.py`, given to `plant_assistant`, `insight_agent` and `twin_agent`):
-`open_in_app(page, label, asset, parameter, location, tab, item_id, view, panel, section)` opens a page of the
-application for the user; it changes nothing in the plant. Pages and the fields that apply:
+Navigation tool (`agent/navigation.py`, given to `plant_assistant`, `insight_agent`, `twin_agent` and
+`maintenance_agent`): `open_in_app(page, label, asset, parameter, location, tab, item_id, view, panel, section,
+filters)` opens a page of the application for the user; it changes nothing in the plant. Pages and the fields
+that apply (each page's `section` ids have their own aliases, `SECTIONS` / `SECTION_ALIASES`):
 
 | page | fields |
 |---|---|
 | `digital-twin` | `asset`, `parameter` (with asset), `location`, `view` (`walk` = first-person walk mode, `orbit` = leave it), `panel` (`plant-overview`) |
-| `ai-insights` | `tab` (`recommendations`, `faults`, `anomalies`, `documents`, `rules`, `injection`), `item_id` (with one of the first three tabs) |
-| `simulation` | `item_id` (job id), `section` `new` (scenario builder; dropped when a job id is given) |
-| `asset-overview` | `asset` (→ `asset_id`, the detail page), `section` (`status`, `parameters`, `spc`; only with asset) |
-| `alarm-report`, `maintenance-order`, `maintenance-performance`, `maintenance-instruction`, `location-overview`, `early-warning-and-diagnostics`, `early-warning-dashboard`, `personnel-management` | — |
+| `ai-insights` | `tab` (`recommendations`, `faults`, `anomalies`, `documents`, `rules`, `injection`), `item_id` (with one of the first three tabs), `filters` of the tab: faults `status`, `equipment`, `rule`, `window`, `display`; anomalies `status`, `equipment`, `detector`, `window`; recommendations `status`; documents `search`, `doc_type`, `status`, `equipment` |
+| `simulation` | `item_id` (job id), `section` `new` (scenario builder) or `new-plan` (production plan form; both dropped when a job id is given), `filters` `status`, `origin`, `workspace` |
+| `production` | `section`: a tab (`overview`, `tools`, `lots`, `quality`), the KPI strip `kpi` and its cards `oee`, `output`, `flow`, or a panel of a tab (`oee-losses` … `capability-summary`; emits its tab as `tab`); `filters` `window` (whole page), lots `lot_status`, `lot_search`, `lot`, quality `characteristic`, `quality_window`, `quality_tool`, tools `timeline_window` (without a section the first tab filter opens its tab; other tabs' filters are ignored) |
+| `plant-overview` | `section` `summary` or `locations`, `filters` `location` (→ its id; the top-level `location` is used as this filter; a leaf location shows its parent's cards, section `locations`) and `period` |
+| `asset-overview` | `asset` (→ `asset_id`, the detail page), `section` (`status`, `parameters`, `spc`, `alarms`, `maintenance` → `recent`; only with asset), `filters` with asset: `date` (one day), `parameter_search`, `parameter` (→ the parameter's name, which the page searches; the top-level `parameter` is used as this filter) |
+| `maintenance-order` | `section` `list` or `calendar` (→ `view`), `filters` `status` (`outstanding` = requested, open, in progress), `severity`, `priority`, `order_type`, `equipment`, `start`, `end`, `search` |
+| `alarm-report` | `section` `report` or `events` (→ `eventview`), `filters` `alarm_type` (one; both = the page's all), `equipment`, `start`, `end`, `search` |
+| `early-warning-and-diagnostics` | `section` `list`, `diagnostics`, `current-issues`, `other-issues`, `filters` `severity`, `equipment`, `start`, `end`, `search` |
+| `maintenance-performance`, `maintenance-instruction`, `location-overview`, `early-warning-dashboard`, `personnel-management` | — |
 
 Validation runs as the user: the page needs `<permission group>.read` of its route (`digitaltwin`,
 `aiinsights`, `simulation`, `equipmentoverview`, `alarmsreport`, `maintenanceorder`, …); `asset` must be
@@ -571,9 +578,31 @@ locations) is refused. One successful call per answer (`temp:navigated` = invoca
 of one answer): the call claims it before anything is awaited, so of several calls in one model response
 (ADK runs them concurrently) the first wins and the others are refused; a call that fails gives the claim
 back. Success: `{"navigation": {page, label, asset, asset_id, parameter, location, tab, item_id, view, panel,
-section}, "status": "opened", "note": "…"}`; failures: `{"error": "…"}`. The model's `label` is used only when
-no field was ignored or dropped, else (and when none is given) a default such as "CT-01 Fan Speed in the
-digital twin"; equipment without a 3D model is mentioned in the note.
+section, filters}, "status": "opened", "note": "…"}`; failures: `{"error": "…"}`. The model's `label` is used
+only when no field was ignored or dropped, else (and when none is given) a default such as "CT-01 Fan Speed in
+the digital twin" or "Maintenance orders · outstanding, critical, CH-01, this week" (the filters' words, cut at
+80 characters); equipment without a 3D model is mentioned in the note.
+
+Filters: `filters` is `{name: value or [values]}` (a dict parameter, like `call_app_api`'s `params`) in
+semantic terms. The tool validates it as the user and returns `filters`: the page's own URL search params
+(URL key → list of strings, ids resolved), plus the tab or view param a section needs (production `tab` for a
+panel, maintenance-order `view`, alarm-report `eventview`, asset-overview `recent`); null when empty. The
+assistant UI appends only the keys it whitelists per page and maps nothing itself. Names are normalised (lower
+case, `_`; aliases such as `assets` → `equipment`, `from` → `start`, and `date` / `period` → `start` on the
+date pages); a value may be a value, a list or a comma-separated string (integral floats count as integers).
+Enums accept aliases (`on hold` → `hold`, `needs approval` → `approval`, window words such as `7d` / `week` →
+168 h); a list that covers every option emits nothing (the page's "All"). Equipment resolves to visible units
+(`resolve_asset`, retried by its tag as a word of the name: `CH-01`, not `PCH-01`) and emits ids, with
+`no-locationIds-filter=true` on the pages of the shared filter (without it the page ignores `assetIds`). Dates
+are plant days: ISO or `today`, `yesterday`, `this-week` (to Sunday on maintenance-order, whose list keeps
+`planned_start < end`), `last-7-days`, `last-30-days`; a start alone runs to today (an ISO date under `date` /
+`day` / `period` / `window` is that one day), at most 366 days. Errors name the filter
+(`Unknown status filter 'stuck'. Use one of: …`); a filter the page (or ai-insights tab) does not take is named
+`filters.<key>` in the note, its value unchecked. Without `start` / `end`, maintenance-order and early warning list only today's
+items, and the note tells the model to say so. Limitation: users without `digitaltwin.read` (maintenance-only
+roles) get equipment rows without aliases from the location filter tree, so equipment resolves by name only
+(the tag retry), the documents `unit` filter is ignored for them and the asset-overview `parameter` is used as
+text.
 
 UI context for the tool: the runner passes the request's `view` and `replay_job_id` (only with
 `page=digital-twin`; the simulation page sends its selected job as `replay_job_id` too) as `temp:ui_view` /
@@ -583,14 +612,15 @@ note). During a replay a twin target stays in that replay (the assistant UI keep
 `variant` and `t` URL parameters when it navigates from a replaying twin): its label ends in
 "(replay of simulation #N)" and the note tells the model the view shows the replayed run, not live data.
 
-The prompts share one static `NAVIGATION` block (pages, fields, aliases, locations with [3D] marks, walk mode,
-replay, examples): navigate only when the user asks to open / show / go to / take me to / where is / walk to
+The prompts share one static `NAVIGATION` block (pages, fields, filters per page, aliases, locations with
+[3D] marks, walk mode, replay, examples; "Plant overview" is the page, the BMS plant overview the twin's
+panel): navigate only when the user asks to open / show / go to / take me to / where is / walk to
 something or for walk mode, at most once per answer, then say in one short sentence what is shown; the root
 handles pure navigation requests itself.
 
 Budget: `before_model_callback` refuses an agent call when today's spend ≥ `AI_DAILY_BUDGET_USD` −
 `AI_ANALYTICS_RESERVE_USD` (0.10, kept for the worker) or the user's own spend ≥ `AI_USER_DAILY_BUDGET_USD`
-(0.20); `after_model_callback` records usage (cached prompt tokens at the cache rate);
+(0.20); a budget of 0 is no limit (compose defaults both to 0 for the demo); `after_model_callback` records usage (cached prompt tokens at the cache rate);
 `RunConfig(max_llm_calls=AI_MAX_LLM_CALLS)` (10). A client that disconnects mid-turn: the call in flight
 finishes and is recorded, no new call starts. Before every call `context.before_model` replaces chart
 options in earlier tool results with a stub (deterministic, so the implicit prompt cache keeps hitting); the
@@ -619,7 +649,7 @@ HTTP API (only reachable through the backend proxy; requires `X-Agent-Secret`):
 | `chart` | `{id, title, option}` |
 | `citations` | `{items:[{document_id, title, doc_type, page, snippet, score}]}` |
 | `simulation` | `{job_id, title, status, approval_required, rationale, spec_summary}` |
-| `navigate` | `{page, label, asset, asset_id, parameter, location, tab, item_id, view, panel, section}` (a successful `open_in_app`; unset keys null; the assistant UI builds the app URL and follows it) |
+| `navigate` | `{page, label, asset, asset_id, parameter, location, tab, item_id, view, panel, section, filters}` (a successful `open_in_app`; unset keys null; `filters` maps URL keys of the page to values; the assistant UI builds the app URL and follows it) |
 | `usage` | `{input_tokens, output_tokens, cost_usd, today_usd, limit_usd}` |
 | `error` | `{message}` |
 | `done` | `{}` |

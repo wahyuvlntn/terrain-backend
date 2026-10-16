@@ -214,9 +214,9 @@ docker compose logs -f ai-analytics
 ```
 
 Settings (in `.env`, read by compose): `GOOGLE_API_KEY` (required for any AI call), `AGENT_SHARED_SECRET`
-(backend proxy to agent; set a random value), `AI_DAILY_BUDGET_USD` (default 0.50, all Gemini spend per
-day), `AI_USER_DAILY_BUDGET_USD` (0.20 per user), `AI_ANALYTICS_RESERVE_USD` (0.10 kept for background
-analytics), `AI_MODEL_FAST` / `AI_MODEL_PRO` (default `gemini-3.5-flash-lite` / `gemini-3.1-pro-preview`).
+(backend proxy to agent; set a random value), `AI_DAILY_BUDGET_USD` (all Gemini spend per day; compose
+default 0 = no limit for the demo), `AI_USER_DAILY_BUDGET_USD` (per user; compose default 0 = no limit),
+`AI_ANALYTICS_RESERVE_USD` (0.10 kept for background analytics when a daily budget is set), `AI_MODEL_FAST` / `AI_MODEL_PRO` (default `gemini-3.5-flash-lite` / `gemini-3.1-pro-preview`).
 Every Gemini call is priced and recorded in `analytics.llm_usage`.
 
 Simulation jobs (what-if scenarios on a copy of the plant) run in the simulator (`SIM_JOBS`, default
